@@ -1,0 +1,102 @@
+# ASTRO BOT Rescue Mission in flat play, checked by tools/astrobot_test.py.
+#
+# "play <level>": the level loads from the world map, Astro gets out of the controller, the
+# camera follows him and holds still while he stands, the right stick turns it, he walks and
+# the camera comes along. Levels by their folder (data/multi_platformer/levels), in the
+# game's own order (mup_product_levels.xml). "skip <scenario>: <why>" leaves one out, saying why.
+
+play world0_0_new_intro_1
+play world0_0_new_intro_2
+play cave_trap_1
+play cave_canyons_half1
+play rope_boss_test_01
+play beanstalk
+play giant_1
+play sea_whale_split1
+play mine_coaster_04
+play water_boss_final
+play cave_canyons_half2
+play giant_2
+play cave_trap_2
+play forest_castle
+play bird_boss_test_01
+play sea_whale_split2
+play heaven
+play world3_1_Indy_cave_split1
+play world3_1_Indy_cave_split2
+play spider_boss_test_01
+play city_funfair_remake
+play cave_graveyard
+play ninja_stage
+play volcano
+play shark_boss_01
+play final_boss
+play collection_room
+play challenge_credits
+skip play challenge_headbutt: not in the level list World 1-1's entry reaches them by (the game asserts m_levels.count)
+play challenge_cannons
+play challenge_caterpillar
+play challenge_extreme_platform
+play challenge_waterfall
+play challenge_dodgeball
+skip play challenge_underwater_down: not in the level list World 1-1's entry reaches them by (the game asserts m_levels.count)
+play challenge_bumpers_easy
+play challenge_water_shooting
+play challenge_bumpers_02
+play challenge_underwater_maze
+skip play challenge_perspective_01: not in the level list World 1-1's entry reaches them by (the game asserts m_levels.count)
+play challenge_rope_pull_02
+skip play challenge_maxi_scale2: not in the level list World 1-1's entry reaches them by (the game asserts m_levels.count)
+play challenge_lasers
+play challenge_vertical_tree
+play challenge_wave
+play challenge_storm_city
+play challenge_tatami
+play challenge_fire_road
+play challenge_machinegun
+play challenge_light
+play challenge_shuriken_shooting
+play challenge_lava2
+play challenge_boss_gorilla
+play challenge_boss_octopus
+play challenge_boss_bird
+play challenge_boss_spider
+play challenge_boss_shark
+play challenge_boss_final
+
+# "open the gadget chest in <level> at <x y z> facing <degrees>" (its place and heading in its
+# level file): Astro stands in front of it with the seat behind him and punches it; it opens where
+# it is (the game's chest flies to the player's head otherwise, through Astro) and he stays.
+# ", then hook the ring at <x y z>": with the hook it gives, the camera turned to that ring and a
+# swipe forward (R1), the rope holds on it.
+open the gadget chest in beanstalk at 0.00 -4.22 -43.21 facing 0
+open the gadget chest in bird_boss_test_01 at 0.00 -0.19 9.05 facing 0
+open the gadget chest in cave_canyons_half1 at 0.00 0.20 15.93 facing 0
+open the gadget chest in cave_canyons_half1 at 0.00 0.20 15.93 facing 0, then hook the ring at 0.00 0.81 14.75
+open the gadget chest in cave_canyons_half2 at 0.88 0.18 -10.83 facing -45
+open the gadget chest in cave_graveyard at -0.07 1.16 5.25 facing -13
+skip open the gadget chest in challenge_boss_bird at 0.00 0.33 1.67 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_boss_gorilla at 0.00 1.00 1.89 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_boss_octopus at 0.00 0.75 1.41 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_boss_shark at 0.00 19.20 2.00 facing 0: the chest comes with the fight (no place of its own in the level file)
+skip open the gadget chest in challenge_boss_spider at 0.00 0.55 0.75 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_credits at 0.00 0.00 0.74 facing 0: the chest comes with the fight (no place of its own in the level file)
+skip open the gadget chest in challenge_lava2 at 0.00 0.55 8.95 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_light at 0.00 1.10 -1.00 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_machinegun at 0.00 1.00 -1.20 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_rope_pull_02 at 0.00 0.95 0.26 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_shuriken_shooting at 0.00 1.10 -3.55 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_tatami at 0.00 0.50 -1.55 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in challenge_water_shooting at 0.00 1.44 -2.50 facing 0: a challenge starts with its gadget fitted (no chest at its start)
+skip open the gadget chest in city_funfair_remake at 0.00 0.17 -48.65 facing 0: it comes out of a jack-in-the-box
+skip open the gadget chest in final_boss at 0.00 0.00 0.74 facing 0: the chest comes with the fight (no place of its own in the level file)
+open the gadget chest in forest_castle at 0.00 0.02 46.08 facing 0
+open the gadget chest in heaven at 1.18 0.13 -0.77 facing -45
+open the gadget chest in ninja_stage at -0.00 0.23 0.60 facing 0
+open the gadget chest in rope_boss_test_01 at 0.00 -16.96 11.05 facing 0
+skip open the gadget chest in shark_boss_01 at 0.00 0.00 2.00 facing 0: the chest comes with the fight (no place of its own in the level file)
+open the gadget chest in spider_boss_test_01 at 0.13 0.04 16.11 facing -11
+open the gadget chest in volcano at 0.00 2.32 18.83 facing 0
+open the gadget chest in water_boss_final at -1.96 0.53 6.88 facing 45
+open the gadget chest in world3_1_Indy_cave_split1 at 0.01 0.20 -52.88 facing 0
+open the gadget chest in world3_1_Indy_cave_split2 at 0.00 0.18 -63.95 facing 0

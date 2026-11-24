@@ -1,0 +1,496 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d22a3b8..85f049c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -931,6 +931,20 @@ set(CORE src/core/aerolib/stubs.cpp
+          src/core/file_sys/directories/pfs_directory.h
+          src/core/file_format/pfs.h
+          src/core/file_format/psf.cpp
++         src/core/file_format/pkg/source.cpp
++         src/core/file_format/pkg/source.h
++         src/core/file_format/pkg/cache.cpp
++         src/core/file_format/pkg/cache.h
++         src/core/file_format/pkg/crypto.cpp
++         src/core/file_format/pkg/crypto.h
++         src/core/file_format/pkg/pfsc.cpp
++         src/core/file_format/pkg/pfsc.h
++         src/core/file_format/pkg/pfs.cpp
++         src/core/file_format/pkg/pfs.h
++         src/core/file_format/pkg/package.cpp
++         src/core/file_format/pkg/package.h
++         src/core/file_format/pkg/entry_names.cpp
++         src/core/file_format/pkg/entry_names.h
+          src/core/file_format/psf.h
+          src/core/file_format/playgo_chunk.cpp
+          src/core/file_format/playgo_chunk.h
+@@ -944,6 +958,8 @@ set(CORE src/core/aerolib/stubs.cpp
+          src/core/file_sys/ifile.h
+          src/core/file_sys/backends/host_fs.cpp
+          src/core/file_sys/backends/host_fs.h
++         src/core/file_sys/backends/pkg_fs.cpp
++         src/core/file_sys/backends/pkg_fs.h
+          src/core/file_sys/backends/zarchive_fs.cpp
+          src/core/file_sys/backends/zarchive_fs.h
+          src/core/ipc/ipc.cpp
+diff --git a/src/common/path_util.cpp b/src/common/path_util.cpp
+index 8038be6..e7463c4 100644
+--- a/src/common/path_util.cpp
++++ b/src/common/path_util.cpp
+@@ -226,7 +226,7 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
+             }
+             return std::nullopt;
+         }
+-        if (Core::FileSys::IsZArchiveFile(root) &&
++        if (Core::FileSys::IsGameArchive(root) &&
+             Core::FileSys::ReadGameFile(root, "sce_sys/param.sfo").has_value()) {
+             return root;
+         }
+@@ -243,8 +243,10 @@ std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& gam
+     if (auto found = boot_path_for(dir / game_id)) {
+         return found;
+     }
+-    if (auto found = boot_path_for(dir / (game_id + ".zar"))) {
+-        return found;
++    for (const std::string_view extension : Core::FileSys::GameArchiveExtensions) {
++        if (auto found = boot_path_for(dir / (game_id + std::string{extension}))) {
++            return found;
++        }
+     }
+ 
+     // Recursively search subdirectories
+diff --git a/src/common/path_util.h b/src/common/path_util.h
+index 922e75f..38fb43a 100644
+--- a/src/common/path_util.h
++++ b/src/common/path_util.h
+@@ -113,8 +113,8 @@ void SetUserPath(PathType user_path, const std::filesystem::path& new_path);
+  * @param game_id The game ID to search for
+  * @param max_depth Maximum directory depth to search
+  *
+- * @returns A path to eboot.bin for an unpacked game, or the ".zar" archive itself for a
+- *          packed one. std::nullopt if the game isn't found.
++ * @returns A path to eboot.bin for an unpacked game, or the archive itself (".zar", ".pkg")
++ *          for a packed one. std::nullopt if the game isn't found.
+  */
+ [[nodiscard]] std::optional<std::filesystem::path> FindGameByID(const std::filesystem::path& dir,
+                                                                 const std::string& game_id,
+diff --git a/src/core/file_sys/fs.cpp b/src/core/file_sys/fs.cpp
+index 3a4387f..5953ffa 100644
+--- a/src/core/file_sys/fs.cpp
++++ b/src/core/file_sys/fs.cpp
+@@ -5,9 +5,9 @@
+ #include <array>
+ #include <unordered_set>
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "common/string_util.h"
+ #include "core/file_sys/backends/host_fs.h"
+-#include "core/file_sys/backends/zarchive_fs.h"
+ #include "core/file_sys/devices/logger.h"
+ #include "core/file_sys/devices/nop_device.h"
+ #include "core/file_sys/fs.h"
+@@ -49,19 +49,13 @@ std::string RemoveTrailingSlashes(const std::string& path) {
+ }
+ 
+ std::filesystem::path OverlayPath(const std::filesystem::path& base, std::string_view suffix) {
+-    std::filesystem::path result = base;
+-    if (result.extension() == ".zar") {
+-        result.replace_extension();
+-    }
++    std::filesystem::path result = StripGameArchiveExtension(base);
+     result += std::string{suffix};
+     return result;
+ }
+ 
+ std::optional<std::filesystem::path> BaseGameFromOverlay(const std::filesystem::path& path) {
+-    std::filesystem::path stem_path = path;
+-    if (stem_path.extension() == ".zar") {
+-        stem_path.replace_extension();
+-    }
++    const std::filesystem::path stem_path = StripGameArchiveExtension(path);
+     const std::string name = stem_path.filename().string();
+     static constexpr std::array<std::string_view, 3> suffixes{"-UPDATE", "-patch", "-mods"};
+     for (const auto suffix : suffixes) {
+@@ -76,13 +70,15 @@ std::optional<std::filesystem::path> ResolveGameRoot(const std::filesystem::path
+     if (std::filesystem::is_directory(root)) {
+         return root;
+     }
+-    if (root.extension() == ".zar" && std::filesystem::is_regular_file(root)) {
++    if (IsGameArchive(root)) {
+         return root;
+     }
+-    std::filesystem::path with_ext = root;
+-    with_ext += ".zar";
+-    if (std::filesystem::is_regular_file(with_ext)) {
+-        return with_ext;
++    for (const auto extension : GameArchiveExtensions) {
++        std::filesystem::path with_ext = root;
++        with_ext += extension;
++        if (IsGameArchive(with_ext)) {
++            return with_ext;
++        }
+     }
+     return std::nullopt;
+ }
+@@ -100,21 +96,17 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
+         if (std::filesystem::is_directory(p)) {
+             return std::make_shared<HostFsBackend>(p, ro);
+         }
+-        const auto try_zar = [ro](const std::filesystem::path& zar) -> std::shared_ptr<IBackend> {
+-            if (std::filesystem::is_regular_file(zar) && zar.extension() == ".zar") {
+-                auto backend = std::make_shared<ZArchiveBackend>(zar);
+-                if (backend->IsOpen()) {
+-                    return backend;
+-                }
+-            }
+-            return nullptr;
+-        };
+-        if (auto b = try_zar(p)) {
++        if (auto b = OpenGameArchive(p)) {
+             return b;
+         }
+-        std::filesystem::path with_ext = p;
+-        with_ext += ".zar";
+-        return try_zar(with_ext);
++        for (const auto extension : GameArchiveExtensions) {
++            std::filesystem::path with_ext = p;
++            with_ext += extension;
++            if (auto b = OpenGameArchive(with_ext)) {
++                return b;
++            }
++        }
++        return nullptr;
+     };
+ 
+     const auto probe_overlay =
+@@ -154,6 +146,16 @@ void MntPoints::Unmount(const std::filesystem::path& host_folder, const std::str
+     m_mnt_pairs.erase(it, m_mnt_pairs.end());
+ }
+ 
++void MntPoints::LogMounts() {
++    std::scoped_lock lock{m_mutex};
++    for (const MntPair& mount : m_mnt_pairs) {
++        // The overlays first, as they are searched.
++        for (const auto& backend : mount.backends) {
++            LOG_INFO(Common_Filesystem, "{} from {}", mount.mount, backend->RootPath().string());
++        }
++    }
++}
++
+ void MntPoints::UnmountAll() {
+     std::scoped_lock lock{m_mutex};
+     m_mnt_pairs.clear();
+diff --git a/src/core/file_sys/fs.h b/src/core/file_sys/fs.h
+index 7123365..4cd1fec 100644
+--- a/src/core/file_sys/fs.h
++++ b/src/core/file_sys/fs.h
+@@ -65,6 +65,8 @@ public:
+                bool read_only = false);
+     void Unmount(const std::filesystem::path& host_folder, const std::string& guest_folder);
+     void UnmountAll();
++    /// Says in the log what each guest folder is read from, overlays and all.
++    void LogMounts();
+ 
+     std::filesystem::path GetHostPath(std::string_view guest_directory,
+                                       bool* is_read_only = nullptr,
+diff --git a/src/core/file_sys/ifile.cpp b/src/core/file_sys/ifile.cpp
+index 69243bb..4ed3b70 100644
+--- a/src/core/file_sys/ifile.cpp
++++ b/src/core/file_sys/ifile.cpp
+@@ -1,25 +1,37 @@
+ // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <fstream>
+ #include <system_error>
+ 
+ #include "common/logging/log.h"
+ #include "common/path_util.h"
+ #include "core/file_sys/backends/host_fs.h"
++#include "core/file_sys/backends/pkg_fs.h"
+ #include "core/file_sys/backends/zarchive_fs.h"
+ #include "core/file_sys/fs.h"
+ #include "core/file_sys/ifile.h"
+ 
+ namespace Core::FileSys {
+ 
+-bool IsZArchiveFile(const std::filesystem::path& path) {
++bool IsGameArchiveExtension(const std::filesystem::path& extension) {
++    return std::ranges::find(GameArchiveExtensions, extension.string()) !=
++           GameArchiveExtensions.end();
++}
++
++bool IsGameArchive(const std::filesystem::path& path) {
+     std::error_code ec;
+-    return path.extension() == ".zar" && std::filesystem::is_regular_file(path, ec) && !ec;
++    return IsGameArchiveExtension(path.extension()) &&
++           std::filesystem::is_regular_file(path, ec) && !ec;
+ }
+ 
+-std::filesystem::path StripZArchiveExtension(const std::filesystem::path& path) {
+-    if (path.extension() == ".zar") {
++bool IsZArchiveFile(const std::filesystem::path& path) {
++    return path.extension() == ".zar" && IsGameArchive(path);
++}
++
++std::filesystem::path StripGameArchiveExtension(const std::filesystem::path& path) {
++    if (IsGameArchiveExtension(path.extension())) {
+         std::filesystem::path stripped = path;
+         stripped.replace_extension();
+         return stripped;
+@@ -27,21 +39,26 @@ std::filesystem::path StripZArchiveExtension(const std::filesystem::path& path)
+     return path;
+ }
+ 
+-std::unique_ptr<IBackend> OpenGameBackend(const std::filesystem::path& root) {
++std::shared_ptr<IBackend> OpenGameArchive(const std::filesystem::path& path) {
++    if (IsZArchiveFile(path)) {
++        auto backend = std::make_shared<ZArchiveBackend>(path);
++        return backend->IsOpen() ? backend : nullptr;
++    }
++    if (IsGameArchive(path)) {
++        return OpenPackage(path);
++    }
++    return nullptr;
++}
++
++std::shared_ptr<IBackend> OpenGameBackend(const std::filesystem::path& root) {
+     const auto resolved = ResolveGameRoot(root);
+     if (!resolved.has_value()) {
+         return nullptr;
+     }
+-
+-    if (IsZArchiveFile(*resolved)) {
+-        auto backend = std::make_unique<ZArchiveBackend>(*resolved);
+-        if (!backend->IsOpen()) {
+-            return nullptr;
+-        }
+-        return backend;
++    if (IsGameArchive(*resolved)) {
++        return OpenGameArchive(*resolved);
+     }
+-
+-    return std::make_unique<HostFsBackend>(*resolved, true);
++    return std::make_shared<HostFsBackend>(*resolved, true);
+ }
+ 
+ std::optional<std::vector<u8>> ReadGameFile(const std::filesystem::path& game_root,
+@@ -110,7 +127,7 @@ std::optional<std::filesystem::path> ResolveGameFilePath(const std::filesystem::
+ u64 GetGameRootSize(const std::filesystem::path& game_root) {
+     std::error_code ec;
+ 
+-    if (IsZArchiveFile(game_root)) {
++    if (IsGameArchive(game_root)) {
+         const auto size = std::filesystem::file_size(game_root, ec);
+         return ec ? 0ull : static_cast<u64>(size);
+     }
+diff --git a/src/core/file_sys/ifile.h b/src/core/file_sys/ifile.h
+index cca25c2..2f51111 100644
+--- a/src/core/file_sys/ifile.h
++++ b/src/core/file_sys/ifile.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <filesystem>
+ #include <functional>
+ #include <memory>
+@@ -205,20 +206,32 @@ public:
+     virtual std::optional<std::vector<u8>> ReadFile(std::string_view rel_path) const = 0;
+ };
+ 
++// The extensions of the files a game can run from in place of a folder: a ZArchive and a
++// PlayStation package.
++inline constexpr std::array<std::string_view, 2> GameArchiveExtensions{".zar", ".pkg"};
++
++[[nodiscard]] bool IsGameArchiveExtension(const std::filesystem::path& extension);
++
++// True if path is a regular file with one of GameArchiveExtensions
++[[nodiscard]] bool IsGameArchive(const std::filesystem::path& path);
++
+ // True if path is a regular file with a ".zar" extension
+ [[nodiscard]] bool IsZArchiveFile(const std::filesystem::path& path);
+ 
+-// Strips a trailing ".zar" extension so overlay suffixes ("-UPDATE", "-patch")
++// Strips a trailing game archive extension so overlay suffixes ("-UPDATE", "-patch")
+ // can be appended to the game's stem regardless of the container type.
+-[[nodiscard]] std::filesystem::path StripZArchiveExtension(const std::filesystem::path& path);
++[[nodiscard]] std::filesystem::path StripGameArchiveExtension(const std::filesystem::path& path);
++
++// The backend of a game archive; nullptr when path is none that opens
++[[nodiscard]] std::shared_ptr<IBackend> OpenGameArchive(const std::filesystem::path& path);
+ 
+-// Resolves a candidate game/overlay root to an existing directory or .zar
+-// archive file
++// Resolves a candidate game/overlay root to an existing directory or game archive
++// file
+ [[nodiscard]] std::optional<std::filesystem::path> ResolveGameRoot(
+     const std::filesystem::path& root);
+ 
+ // Opens the appropriate backend for root
+-[[nodiscard]] std::unique_ptr<IBackend> OpenGameBackend(const std::filesystem::path& root);
++[[nodiscard]] std::shared_ptr<IBackend> OpenGameBackend(const std::filesystem::path& root);
+ 
+ [[nodiscard]] std::optional<std::vector<u8>> ReadGameFile(const std::filesystem::path& game_root,
+                                                           std::string_view rel_path);
+diff --git a/src/emulator.cpp b/src/emulator.cpp
+index 5f2d11d..2973a2d 100644
+--- a/src/emulator.cpp
++++ b/src/emulator.cpp
+@@ -298,7 +298,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+         for (const auto& comp : file) {
+             if (!found) {
+                 accum /= comp;
+-                if (comp.extension() == ".zar") {
++                if (FileSys::IsGameArchiveExtension(comp.extension())) {
+                     found = true;
+                     archive_path = accum;
+                 }
+@@ -306,7 +306,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+                 archive_inner /= comp;
+             }
+         }
+-        // Only treat it as an archive if the .zar element is a real file.
++        // Only treat it as an archive if the archive element is a real file.
+         if (found && !std::filesystem::is_regular_file(archive_path)) {
+             found = false;
+         }
+@@ -493,6 +493,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+     LOG_INFO(Loader, "Branch {}", Common::g_scm_branch);
+     LOG_INFO(Loader, "Description {}", Common::g_scm_desc);
+     LOG_INFO(Loader, "Remote {}", Common::g_scm_remote_url);
++    // Those made before the log started (the game's own).
++    mnt->LogMounts();
+ 
+     LOG_INFO(Config, "Game-specific config used: {}",
+              EmulatorState::GetInstance()->IsGameSpecifigConfigUsed());
+@@ -745,14 +747,13 @@ void Emulator::Restart(std::filesystem::path eboot_path,
+ 
+     auto& game_info = Common::ElfInfo::Instance();
+     const auto& game_folder = game_info.GetGameFolder();
+-    const bool from_archive =
+-        std::filesystem::is_regular_file(game_folder) && game_folder.extension() == ".zar";
++    const bool from_archive = FileSys::IsGameArchive(game_folder);
+ 
+     args.push_back("--log-append");
+ 
+     if (from_archive) {
+         // Archive-backed base game: relaunch by pointing --game at the
+-        // .zar itself. Run() re-detects the extension and re-mounts it.
++        // archive itself. Run() re-detects the extension and re-mounts it.
+         std::filesystem::path relaunch = game_folder;
+         std::string guest = Common::FS::PathToUTF8String(eboot_path);
+         for (const std::string_view prefix : {"/app0/", "/hostapp/"}) {
+diff --git a/src/imgui/big_picture/big_picture.cpp b/src/imgui/big_picture/big_picture.cpp
+index bab0b82..d0dee70 100644
+--- a/src/imgui/big_picture/big_picture.cpp
++++ b/src/imgui/big_picture/big_picture.cpp
+@@ -40,26 +40,27 @@ std::filesystem::path UpdateChecker(const std::string sceItem, std::filesystem::
+     std::string fileName;
+     std::string item = "sce_sys/" + sceItem;
+ 
+-    if (Core::FileSys::IsZArchiveFile(game_folder)) {
+-        fileName = Core::FileSys::StripZArchiveExtension(game_folder).filename().string();
+-    } else {
+-        fileName = game_folder.filename().string();
+-    }
++    fileName = Core::FileSys::StripGameArchiveExtension(game_folder).filename().string();
+ 
+-    if (std::filesystem::exists(basePath / (fileName + "-UPDATE") / item)) {
+-        updatedPath = basePath / (fileName + "-UPDATE") / item;
+-    } else if (Core::FileSys::ResolveGameFilePath(basePath / (fileName + "-UPDATE.zar"), item)
+-                   .has_value()) {
+-        updatedPath =
+-            Core::FileSys::ResolveGameFilePath(basePath / (fileName + "-UPDATE.zar"), item).value();
+-    } else if (std::filesystem::exists(basePath / (fileName + "-patch") / item)) {
+-        updatedPath = basePath / (fileName + "-patch") / item;
+-    } else if (Core::FileSys::ResolveGameFilePath(basePath / (fileName + "-patch.zar"), item)
+-                   .has_value()) {
+-        updatedPath =
+-            Core::FileSys::ResolveGameFilePath(basePath / (fileName + "-patch.zar"), item).value();
+-    } else if (Core::FileSys::ResolveGameFilePath(game_folder, item).has_value()) {
+-        updatedPath = Core::FileSys::ResolveGameFilePath(game_folder, item).value();
++    // An overlay of the game: a folder, or an archive of any kind.
++    const auto overlay = [&](const std::string& suffix) -> std::optional<std::filesystem::path> {
++        if (std::filesystem::exists(basePath / (fileName + suffix) / item)) {
++            return basePath / (fileName + suffix) / item;
++        }
++        for (const std::string_view extension : Core::FileSys::GameArchiveExtensions) {
++            if (auto found = Core::FileSys::ResolveGameFilePath(
++                    basePath / (fileName + suffix + std::string{extension}), item)) {
++                return found;
++            }
++        }
++        return std::nullopt;
++    };
++    if (auto found = overlay("-UPDATE")) {
++        updatedPath = *found;
++    } else if (auto found = overlay("-patch")) {
++        updatedPath = *found;
++    } else if (auto found = Core::FileSys::ResolveGameFilePath(game_folder, item)) {
++        updatedPath = *found;
+     }
+ 
+     return updatedPath;
+@@ -165,21 +166,13 @@ void GetGameIconInfo(std::vector<IconInfo>& icons) {
+             for (const auto& entry : std::filesystem::directory_iterator(installLoc.path)) {
+ 
+                 std::string pathstring = entry.path().filename().string();
+-                if (pathstring.ends_with("-UPDATE") || pathstring.ends_with("-patch") ||
+-                    (!entry.is_directory() && !Core::FileSys::IsZArchiveFile(entry))) {
++                if (!entry.is_directory() && !Core::FileSys::IsGameArchive(entry)) {
+                     continue;
+                 }
+-
+-                if (Core::FileSys::IsZArchiveFile(entry)) {
+-                    size_t start = pathstring.length() - 3;
+-                    for (size_t i = start; i < pathstring.length(); ++i) {
+-                        pathstring[i] = static_cast<char>(
+-                            std::tolower(static_cast<unsigned char>(pathstring[i])));
+-                    }
+-
+-                    if (pathstring.ends_with("-UPDATE.zar") || pathstring.ends_with("-patch.zar")) {
+-                        continue;
+-                    }
++                const std::string stem =
++                    Core::FileSys::StripGameArchiveExtension(entry.path()).filename().string();
++                if (stem.ends_with("-UPDATE") || stem.ends_with("-patch")) {
++                    continue;
+                 }
+ 
+                 IconInfo icon;
+@@ -188,6 +181,11 @@ void GetGameIconInfo(std::vector<IconInfo>& icons) {
+                 std::filesystem::path sfoPath = UpdateChecker(sfoFileName, entry.path());
+ 
+                 if (std::filesystem::exists(sfoPath) && psf.Open(sfoPath)) {
++                    // An update's package beside its game's is not a game of its own.
++                    if (const auto category = psf.GetString("CATEGORY");
++                        category.has_value() && category->starts_with("gp")) {
++                        continue;
++                    }
+                     if (const auto title = psf.GetString("TITLE"); title.has_value()) {
+                         icon.title = *title;
+                     }
+@@ -206,7 +204,7 @@ void GetGameIconInfo(std::vector<IconInfo>& icons) {
+                 icon.textureId = ImTextureID(texture);
+ 
+                 icon.ebootPath = entry.path() / "eboot.bin";
+-                if (Core::FileSys::IsZArchiveFile(entry.path())) {
++                if (Core::FileSys::IsGameArchive(entry.path())) {
+                     icon.ebootPath = entry.path();
+                 }
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 92d9e8a..835e496 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -227,7 +227,7 @@ int main(int argc, char* argv[]) {
+         std::filesystem::path accum;
+         for (const auto& comp : p) {
+             accum /= comp;
+-            if (comp.extension() == ".zar") {
++            if (Core::FileSys::IsGameArchiveExtension(comp.extension())) {
+                 return std::filesystem::is_regular_file(accum);
+             }
+         }

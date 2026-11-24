@@ -1,0 +1,24 @@
+# ASTRO BOT Rescue Mission: edits to the game's own data, for flat play.
+# The game blacks the picture out the moment the player's head touches anything; a camera on a
+# flat screen does all the time. Tolerate it for good instead.
+data/multi_platformer/multi_platformer.xml | CollisionBlackoutToleranceTime | 1000000.000000
+# The player's controller floats at the seat, where flat play's camera no longer is: solid, it
+# stops Astro mid-jump. Make it something he passes through.
+data/multi_platformer/multi_platformer.xml | ControllerCollision/CollisionRadius | 0.001000
+data/multi_platformer/multi_platformer.xml | ControllerCollision/CollisionHalfLength | 0.001000
+# A gadget chest Astro has hit flies to just in front of the player's head and waits for the
+# controller to be put in it (within 5 cm). In flat play that head is the camera behind Astro: the
+# chest lands on him and pushes him off small platforms, and the controller never comes. Send it
+# at once to above the camera, clear of him, and take the controller from wherever it is.
+data/multi_platformer/multi_platformer.xml | GadgetChest/FlyComeTime | 0.010000
+data/multi_platformer/multi_platformer.xml | GadgetChest/FlyComeTimeQuick | 0.010000
+data/multi_platformer/multi_platformer.xml | GadgetChest/GoalPosition | +0.000 +1.200 -0.730
+data/multi_platformer/multi_platformer.xml | GadgetChest/GoalPositionForQuick | +0.000 +1.200 -0.730
+data/multi_platformer/multi_platformer.xml | GadgetChest/PadConnectRange | 100.000000
+
+# Dandelions take a blow (the touchpad pressed, in flat play) only from a head within 2 m looking
+# at them; in flat play the head is the camera, behind and above Astro, rarely that near.
+# Everything else in these levels that is looked at answers from 5 m (as the collection room's
+# dandelion does).
+data/multi_platformer/levels/beanstalk/lvx/design.lvx | LookAtFar | 5.0
+data/multi_platformer/levels/cave_canyons_half2/lvx/design.lvx | LookAtFar | 5.0

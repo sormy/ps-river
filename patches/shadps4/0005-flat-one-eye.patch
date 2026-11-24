@@ -1,0 +1,203 @@
+diff --git a/src/core/vr/flat_mode.h b/src/core/vr/flat_mode.h
+index 938a553..50fde43 100644
+--- a/src/core/vr/flat_mode.h
++++ b/src/core/vr/flat_mode.h
+@@ -43,6 +43,15 @@ inline bool FlatMono() {
+     return mono;
+ }
+ 
++/// SHADPS4_VR_FLAT_ONE_EYE=0: in stereo, the eye that is not shown is drawn as well.
++inline bool FlatOneEye() {
++    static const bool one_eye = [] {
++        const char* value = std::getenv("SHADPS4_VR_FLAT_ONE_EYE");
++        return FlatMode() && !FlatMono() && (value == nullptr || value[0] != '0');
++    }();
++    return one_eye;
++}
++
+ /// SHADPS4_VR_FLAT_GYRO_AIM=1 (experimental): gadgets aim where the camera looks, turned on by
+ /// the controller's own motion since the view was last moved with the stick.
+ inline bool FlatGyroAim() {
+diff --git a/src/core/vr/unseen_eye.h b/src/core/vr/unseen_eye.h
+new file mode 100644
+index 0000000..4d3536d
+--- /dev/null
++++ b/src/core/vr/unseen_eye.h
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace Core::Vr {
++
++/// When only one eye's picture is shown (flat play), the other eye need not be drawn. Titles
++/// draw the eyes one after the other, so once the shown eye's picture has been drawn, what
++/// else is drawn before the frame is handed over is the other eye's. Used on the GPU thread.
++class UnseenEye {
++public:
++    /// A frame was handed over, the shown eye's picture at `shown` (titles cycle through a few).
++    void HandedOver(std::uintptr_t shown) {
++        if (std::ranges::find(pictures, shown) == pictures.end()) {
++            pictures[next] = shown;
++            next = (next + 1) % pictures.size();
++        }
++        shown_drawn = false;
++    }
++
++    /// Whether a draw into `target` (0: no colour target) is left out.
++    bool LeaveOut(std::uintptr_t target) {
++        if (target != 0 && std::ranges::find(pictures, target) != pictures.end()) {
++            shown_drawn = true;
++            return false;
++        }
++        return shown_drawn;
++    }
++
++private:
++    static constexpr std::size_t Remembered = 4;
++    std::array<std::uintptr_t, Remembered> pictures{};
++    std::size_t next{};
++    bool shown_drawn{};
++};
++
++} // namespace Core::Vr
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 070069d..1801d9b 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -1085,6 +1085,9 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
+         image_ids[eye] = texture_cache.FindImage(descs[eye]);
+         texture_cache.UpdateImage(image_ids[eye]);
+     }
++    if (Core::Vr::FlatOneEye()) {
++        rasterizer->EyeHandedOver(texture_cache.GetImage(image_ids[0]).info.guest_address);
++    }
+ 
+     // Diagnostics: creating <UserDir>/dump_render_targets dumps what the guest has rendered so
+     // far, once, to tell a guest that draws nothing apart from output that gets lost on the way.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 6045fdc..dd5c69e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "common/debug.h"
+ #include "core/debug_state.h"
++#include "core/vr/flat_mode.h"
+ #include "core/emulator_settings.h"
+ #include "core/known_title.h"
+ #include "core/memory.h"
+@@ -291,6 +292,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+         return;
+     }
+     const auto& regs = liverpool->regs;
++    if (Core::Vr::FlatOneEye() && unseen_eye.LeaveOut(regs.color_buffers[0].Address())) {
++        return;
++    }
+     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+     if (pipeline != nullptr && !in_target_passes) {
+         if (const auto passes = SharedTargetPasses(pipeline->GetGraphicsKey().mrt_mask);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index b475430..448bc07 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -11,6 +11,7 @@
+ 
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
++#include "core/vr/unseen_eye.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+ #include "video_core/page_manager.h"
+ #include "video_core/renderer_vulkan/vk_gpu_profile.h"
+@@ -51,6 +52,12 @@ public:
+     /// Whether draws are being traced at the moment.
+     static bool DrawTraceActive();
+ 
++    /// A frame went to the headset, the eye that is shown (Core::Vr::FlatOneEye) drawn at
++    /// `shown`: what is drawn after it in the next frame is the other eye's, and is left out.
++    void EyeHandedOver(VAddr shown) {
++        unseen_eye.HandedOver(shown);
++    }
++
+     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
+         return buffer_cache;
+     }
+@@ -193,6 +200,7 @@ private:
+     boost::container::small_vector<vk::DescriptorImageInfo,
+                                    Shader::NUM_IMAGES + Shader::NUM_SAMPLERS>
+         image_infos;
++    Core::Vr::UnseenEye unseen_eye;
+     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+     boost::container::small_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+ 
+diff --git a/tools/tests/unseen_eye_test.cpp b/tools/tests/unseen_eye_test.cpp
+new file mode 100644
+index 0000000..58d1981
+--- /dev/null
++++ b/tools/tests/unseen_eye_test.cpp
+@@ -0,0 +1,59 @@
++// Tests for Core::Vr::UnseenEye: what is drawn after the shown eye's picture, until the frame
++// is handed over, is left out.
++#include <cstdio>
++#include <cstdlib>
++#include "core/vr/unseen_eye.h"
++
++namespace {
++
++int failures = 0;
++
++void Check(bool ok, const char* what) {
++    std::printf("%s %s\n", ok ? "ok   " : "FAIL ", what);
++    failures += ok ? 0 : 1;
++}
++
++constexpr std::uintptr_t Shadow = 0x1000;
++constexpr std::uintptr_t Scene = 0x2000;
++constexpr std::uintptr_t LeftPicture = 0x3000;
++constexpr std::uintptr_t NextLeftPicture = 0x4000;
++constexpr std::uintptr_t DepthOnly = 0;
++
++void BeforeAnyFrame() {
++    Core::Vr::UnseenEye eye;
++    Check(!eye.LeaveOut(Scene) && !eye.LeaveOut(DepthOnly), "nothing is left out before a frame was handed over");
++}
++
++void OneFrame() {
++    Core::Vr::UnseenEye eye;
++    eye.HandedOver(LeftPicture);
++    Check(!eye.LeaveOut(Shadow) && !eye.LeaveOut(DepthOnly) && !eye.LeaveOut(Scene),
++          "the shared shadow and the shown eye are drawn");
++    Check(!eye.LeaveOut(LeftPicture) && !eye.LeaveOut(LeftPicture), "and so is the shown eye's picture, every draw of it");
++    Check(eye.LeaveOut(DepthOnly) && eye.LeaveOut(Scene), "after it, the other eye is left out, depth included");
++    eye.HandedOver(LeftPicture);
++    Check(!eye.LeaveOut(Shadow), "the next frame is drawn again");
++}
++
++void CycledPictures() {
++    Core::Vr::UnseenEye eye;
++    eye.HandedOver(LeftPicture);
++    eye.HandedOver(NextLeftPicture);
++    eye.LeaveOut(Scene);
++    eye.LeaveOut(LeftPicture);
++    Check(eye.LeaveOut(Scene), "every picture the shown eye cycles through counts");
++}
++
++} // namespace
++
++int main() {
++    BeforeAnyFrame();
++    OneFrame();
++    CycledPictures();
++    if (failures != 0) {
++        std::printf("%d failed\n", failures);
++        return EXIT_FAILURE;
++    }
++    std::printf("all passed\n");
++    return EXIT_SUCCESS;
++}

@@ -1,0 +1,7 @@
+.build/
+games/
+__pycache__
+*.local.*
+TODO.md
+WORKLOG.md
+.claude/

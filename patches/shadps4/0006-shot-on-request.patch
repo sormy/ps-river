@@ -1,0 +1,19 @@
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 1801d9b..cf82c9e 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -1847,6 +1847,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+             VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
+         }
+     }
++    // SHADPS4_SHOT_ON=<file>: a picture whenever the file appears (it is taken away), for tests
++    // that want one of a game they cannot see on the screen.
++    if (static const char* const shot_on = std::getenv("SHADPS4_SHOT_ON"); shot_on != nullptr) {
++        std::error_code missing;
++        if (std::filesystem::remove(shot_on, missing)) {
++            VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::WithOverlays);
++        }
++    }
+     // Free the frame for reuse. One that was shown again was taken out of the pool for that.
+     const auto free_frame = [&] {
+         std::scoped_lock fl{free_mutex};

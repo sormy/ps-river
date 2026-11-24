@@ -1,0 +1,3179 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 85f049c..493b458 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1258,6 +1258,8 @@ set(IMGUI src/imgui/imgui_config.h
+           src/imgui/shadnet_notifications_layer.h
+           src/imgui/notifications_layer.cpp
+           src/imgui/notifications_layer.h
++          src/imgui/fade_picture_layer.cpp
++          src/imgui/fade_picture_layer.h
+           src/imgui/renderer/imgui_core.cpp
+           src/imgui/renderer/imgui_core.h
+           src/imgui/renderer/imgui_impl_sdl3.cpp
+diff --git a/src/core/cpu_patches.cpp b/src/core/cpu_patches.cpp
+index 4375f88..d079f77 100644
+--- a/src/core/cpu_patches.cpp
++++ b/src/core/cpu_patches.cpp
+@@ -2191,6 +2191,24 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
+                                           trampoline_area_size));
+ }
+ 
++u8* AllocateModuleCode(const void* module_ptr, u64 size) {
++    PatchModule* const module = GetModule(module_ptr);
++    if (module == nullptr) {
++        return nullptr;
++    }
++    std::scoped_lock lock{module->mutex};
++    auto& gen = module->trampoline_gen;
++    u8* const room = const_cast<u8*>(gen.getCurr());
++    try {
++        for (u64 i = 0; i < size; ++i) {
++            gen.db(0xcc);
++        }
++    } catch (const Xbyak::Error&) {
++        return nullptr;
++    }
++    return room;
++}
++
+ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
+ #if !defined(_WIN32) && !defined(__APPLE__)
+     // Linux and others have an FS segment pointing to valid memory, so continue to do full
+diff --git a/src/core/cpu_patches.h b/src/core/cpu_patches.h
+index a8ac368..24d193d 100644
+--- a/src/core/cpu_patches.h
++++ b/src/core/cpu_patches.h
+@@ -51,6 +51,10 @@ struct RedZonePatchResult {
+ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_area_ptr,
+                          u64 trampoline_area_size);
+ 
++/// Room for `size` bytes of one's own code in a module's trampoline area, within reach of a
++/// near call from the module's code; nullptr when the module is not known or the area is full.
++u8* AllocateModuleCode(const void* module_ptr, u64 size);
++
+ /// Applies CPU patches that need to be done before beginning executions.
+ void PrePatchInstructions(u64 segment_addr, u64 segment_size);
+ 
+diff --git a/src/core/known_title.cpp b/src/core/known_title.cpp
+index bf9957b..1e2a965 100644
+--- a/src/core/known_title.cpp
++++ b/src/core/known_title.cpp
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
++#include <cstddef>
+ #include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+@@ -19,15 +20,19 @@
+ #include <unordered_map>
+ #include <vector>
+ #include <fmt/format.h>
++#include <limits>
+ 
+ #include "common/elf_info.h"
++#include "common/io_file.h"
+ #include "common/logging/log.h"
+ #include "common/path_util.h"
++#include "core/cpu_patches.h"
+ #include "core/emulator_settings.h"
+ #include "core/known_title.h"
+ #include "core/known_title_builds.h"
+ #include "core/known_title_scenes.h"
+ #include "core/memory.h"
++#include "core/vr/flat_mode.h"
+ #include "core/vr/vr_runtime.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+@@ -42,6 +47,7 @@ using Clock = std::chrono::steady_clock;
+ // inside, and how a build is told from the others, is in known_title_builds.h; what follows is
+ // the same in all of them.
+ using Builds::Build;
++using Builds::PlayerModel;
+ 
+ /// Whether the title is Astro Bot Rescue Mission in a release whose builds may be among those
+ /// known: the European one (CUSA12392), or the American one (CUSA12431, issue #35). Which build
+@@ -1346,6 +1352,420 @@ private:
+ 
+ PhysicsWatch physics_watch;
+ 
++// A level's physics world starts with the player's head: a row of bodies along the way it
++// faces (the front, the middle and the back of it, each moved its own way) and two more, then
++// the hero. Menus have other bodies there, which is how a level is told from them.
++constexpr u32 HeadFront = 0;
++constexpr u32 HeadMiddle = 1;
++constexpr u32 HeadBack = 2;
++constexpr u32 HeroBody = 5;
++constexpr u32 ControllerBody = 7;
++// At a level's end the hero waits in the controller, a catapult, to be shot through the goal's
++// rings, which the goal keeps moving a few metres ahead and above it (their bodies are this
++// kind; others of it lie about, below).
++constexpr u32 GoalRingsKind = 0x20;
++constexpr float InControllerWithin = 0.1f; // metres
++constexpr float RingsWithin = 8.0f;        // metres from the controller
++constexpr std::array<u8, 3> HeadMotions{2, 0, 4};
++constexpr float HeadLength = 0.18f; // metres from its front body to its back one
++constexpr float HeadTolerance = 0.05f;
++// Rooms may seat the player bigger or smaller (the collection room: twice the size).
++constexpr float HeadSmallest = 0.7f;
++constexpr float HeadLargest = 2.5f;
++
++/// The player's model (a base below the head that follows it a little, a neck up to the head,
++/// and a cape that collides) is drawn round where the head is. Played flat, the head is the
++/// camera behind the hero: the model fills the view, the neck stretches from near the seat to
++/// the camera across the level and the hero runs into it and the cape. Parts of it keep a size
++/// whatever its scale: it is shrunk, its base made to follow the head all the way, and the
++/// whole of it drawn far below the head, under the level.
++void HidePlayerModel() {
++    const Build* const build = known_build.load(std::memory_order_acquire);
++    if (build == nullptr) {
++        return;
++    }
++    constexpr float Hidden = 0.001f;
++    constexpr float Whole = 1.0f;
++    constexpr float Unlimited = 1000.0f;
++    // Past the far plane: the pieces the scale leaves (a stretched strip) then never show.
++    constexpr float Buried = -5000.0f;
++    auto* const memory = Core::Memory::Instance();
++    const u64 settings = Read<u64>(known_base + build->player_settings_pointer);
++    if (settings == 0) {
++        return;
++    }
++    const auto set = [&](u64 offset, float value) {
++        const VAddr at = settings + offset;
++        if (memory->IsValidMapping(at, sizeof(float)) && Read<float>(at) != value) {
++            Write<float>(at, value);
++        }
++    };
++    const PlayerModel& model = build->player_model;
++    set(model.scale, Hidden);
++    set(model.cape_length, Hidden);
++    for (const u64 radius : model.cape_radii) {
++        set(radius, Hidden);
++    }
++    set(model.base_follow, Whole);
++    set(model.base_follow_limit, Unlimited);
++    set(model.base_follow_up, Whole);
++    set(model.head_height, Buried);
++    set(model.base_height, Buried);
++}
++
++/// Has the title draw one picture from the head instead of a headset's two (its own Mono
++/// display), zoomed as flat play's camera frames its view: half the drawing, the same picture.
++void DrawMono() {
++    const Build* const build = known_build.load(std::memory_order_acquire);
++    if (build == nullptr || !Vr::FlatMono()) {
++        return;
++    }
++    namespace AppConfig = Builds::AppConfig;
++    auto* const memory = Core::Memory::Instance();
++    const auto setting = [&](u64 config, u64 slot) -> VAddr {
++        const u64 at = Read<u64>(config + slot);
++        return at != 0 && memory->IsValidMapping(at + AppConfig::Value, sizeof(float)) ? at + AppConfig::Value : 0;
++    };
++    const u64 config = Read<u64>(known_base + build->app_config_pointer);
++    if (config == 0 || !memory->IsValidMapping(config + AppConfig::MonoModeZoom, sizeof(u64))) {
++        return;
++    }
++    if (const VAddr display = setting(config, AppConfig::MainDisplay);
++        display != 0 && Read<s32>(display) != AppConfig::Mono) {
++        Write<s32>(display, AppConfig::Mono);
++        LOG_INFO(Core, "Flat play: the title draws one picture instead of a headset's two");
++    }
++    if (const VAddr zoom = setting(config, AppConfig::MonoModeZoom); zoom != 0) {
++        Write<float>(zoom, AppConfig::MonoZoomAtOne * Vr::PictureZoom());
++    }
++}
++
++/// The game's sphere cast's query and answer (its own units).
++struct alignas(16) SphereQuery {
++    std::array<float, 4> from;
++    std::array<float, 4> to;
++    float radius;
++    u32 collides_as;   // what the sphere is, for the bodies' filters
++    u32 collides_with; // what it may touch
++};
++struct alignas(16) SphereHit {
++    u8 hit;
++    std::array<u8, 0x33> unused;
++    float fraction; // along from-to, 1 for none
++    std::array<u8, 0x48> rest;
++};
++static_assert(offsetof(SphereHit, fraction) == 0x34);
++using SphereCast = SphereHit*(PS4_SYSV_ABI*)(SphereHit*, u64 world, const SphereQuery*);
++/// What a body is (self) and accepts (target) decide what touches it: the level's own bodies are
++/// 0x10 and accept all but 0x04000000, the hero accepts all but 0x80000000, the player's head
++/// 0x100000 or 0x200. A cast that is 0x80000000 and touches 0x10 finds the level alone.
++constexpr u32 CastKind = 0x80000000;
++constexpr u32 LevelKind = 0x10;
++
++/// One of flat play's camera casts, through the game's own sphere cast. On the game's thread,
++/// between physics steps.
++u64 HeroWorld();
++
++float CastSphere(const Vr::FlatCast& cast) {
++    const Build* const build = known_build.load(std::memory_order_acquire);
++    if (build == nullptr) {
++        return 1.0f;
++    }
++    const u64 world = HeroWorld();
++    if (world == 0) {
++        return 1.0f;
++    }
++    // The cast scales its query to the library's units itself: it takes the game's, not the
++    // bodies' (which flat play's casts are in).
++    const float scale = Read<float>(Read<u64>(world + Builds::Physics::WorldInner) + Builds::Physics::InnerScale);
++    const SphereQuery query{.from = {cast.from.x / scale, cast.from.y / scale, cast.from.z / scale, 0.0f},
++                            .to = {cast.to.x / scale, cast.to.y / scale, cast.to.z / scale, 0.0f},
++                            .radius = cast.radius / scale,
++                            .collides_as = CastKind,
++                            .collides_with = LevelKind};
++    SphereHit hit{};
++    hit.fraction = 1.0f;
++    reinterpret_cast<SphereCast>(known_base + build->sphere_cast)(&hit, world, &query);
++    return hit.hit != 0 ? std::clamp(hit.fraction, 0.0f, 1.0f) : 1.0f;
++}
++
++void PS4_SYSV_ABI AfterPhysicsStep() {
++    Vr::RunFlatCasts(CastSphere);
++}
++
++/// Has the game's call of its library's physics step go through a trampoline that takes the
++/// step and then runs flat play's camera casts: the moment the game's physics stand still.
++void HookPhysicsStep(VAddr base, const Build& build) {
++    // sub rsp, 0x28; call <step>; mov [rsp], rax; movups [rsp+0x10], xmm0;
++    // mov rax, <AfterPhysicsStep>; call rax; mov rax, [rsp]; movups xmm0, [rsp+0x10];
++    // add rsp, 0x28; ret
++    constexpr std::array<u8, 44> Trampoline{
++        0x48, 0x83, 0xec, 0x28, 0xe8, 0, 0, 0, 0, 0x48, 0x89, 0x04, 0x24, 0x0f, 0x11,
++        0x44, 0x24, 0x10, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xd0, 0x48,
++        0x8b, 0x04, 0x24, 0x0f, 0x10, 0x44, 0x24, 0x10, 0x48, 0x83, 0xc4, 0x28, 0xc3};
++    constexpr u64 StepCall = 4;
++    constexpr u64 HostCall = 20;
++    constexpr u64 Reach = 0x20; // bytes after physics_step's start where the call is
++    const VAddr step = base + build.library_step;
++    const VAddr from = base + build.physics_step[0].at;
++    VAddr site = 0;
++    for (VAddr at = from; at < from + Reach; ++at) {
++        const u8 op = Read<u8>(at);
++        if ((op == 0xe8 || op == 0xe9) && at + 5 + Read<s32>(at + 1) == step) {
++            site = at;
++            break;
++        }
++    }
++    if (site == 0) {
++        LOG_WARNING(Core, "Flat play: the title's physics step was not found where expected; the "
++                          "camera keeps no clear of walls");
++        return;
++    }
++    u8* const room = Core::AllocateModuleCode(reinterpret_cast<const void*>(base), Trampoline.size());
++    if (room == nullptr) {
++        LOG_WARNING(Core, "Flat play: no room for a trampoline; the camera keeps no clear of walls");
++        return;
++    }
++    const VAddr trampoline = reinterpret_cast<VAddr>(room);
++    std::memcpy(room, Trampoline.data(), Trampoline.size());
++    Write<s32>(trampoline + StepCall + 1, static_cast<s32>(step - (trampoline + StepCall + 5)));
++    Write<u64>(trampoline + HostCall, reinterpret_cast<u64>(&AfterPhysicsStep));
++    Write<s32>(site + 1, static_cast<s32>(trampoline - (site + 5)));
++    LOG_INFO(Core, "Flat play: the camera's casts run after each physics step ({:#x})", site - base);
++}
++
++/// The world map's menu object, as its constructor was last given it (0: none yet).
++std::atomic<VAddr> world_menu{0};
++
++PS4_SYSV_ABI void NoteWorldMenu(VAddr menu) {
++    world_menu.store(menu, std::memory_order_release);
++}
++
++/// The rooms constructed lately, oldest overwritten (a level and its overlays live at once).
++constexpr std::size_t KeptRooms = 64;
++std::array<std::atomic<VAddr>, KeptRooms> rooms{};
++std::atomic<std::size_t> next_room{0};
++
++PS4_SYSV_ABI void NoteRoom(VAddr room) {
++    rooms[next_room.fetch_add(1, std::memory_order_relaxed) % KeptRooms].store(room, std::memory_order_release);
++}
++
++bool HasVtable(VAddr object, u64 vtable, u64 size) {
++    return object != 0 && Core::Memory::Instance()->IsValidMapping(object, size) &&
++           Read<u64>(object) == known_base + vtable;
++}
++
++/// Whether the pause menu holds the room played: the newest one still alive. (One left behind,
++/// as the world map's while a level is played, stays paused.)
++bool RoomPaused(const Build& build) {
++    constexpr u64 Size = Builds::Room::Paused + sizeof(u32);
++    if (build.room_vtable == 0) {
++        return false;
++    }
++    const std::size_t next = next_room.load(std::memory_order_acquire);
++    for (std::size_t back = 1; back <= std::min(next, KeptRooms); ++back) {
++        const VAddr room = rooms[(next - back) % KeptRooms].load(std::memory_order_acquire);
++        if (HasVtable(room, build.room_vtable, Size)) {
++            return Read<u32>(room + Builds::Room::Paused) != 0;
++        }
++    }
++    return false;
++}
++
++/// Which menu screen shows: the pause menu, else the world map's, from its menu's own state.
++std::optional<Vr::FlatMenuView> MenuView() {
++    namespace WorldMenu = Builds::WorldMenu;
++    const Build* const build = known_build.load(std::memory_order_acquire);
++    if (build == nullptr) {
++        return std::nullopt;
++    }
++    if (RoomPaused(*build)) {
++        return Vr::FlatMenuView::Paused;
++    }
++    if (build->world_menu_vtable == 0) {
++        return std::nullopt;
++    }
++    const VAddr menu = world_menu.load(std::memory_order_acquire);
++    if (!HasVtable(menu, build->world_menu_vtable, WorldMenu::State + sizeof(u32))) {
++        return Vr::FlatMenuView::Title;
++    }
++    const u32 state = Read<u32>(menu + WorldMenu::State);
++    return state == WorldMenu::FlyingIn || state == WorldMenu::Levels ? Vr::FlatMenuView::Levels
++                                                                      : Vr::FlatMenuView::Map;
++}
++
++/// Has the title's call at `call` to `constructor` also hand each object it constructs to
++/// `note` (for `what`, in the log). Both are module offsets; 0: not known, nothing done.
++void HookConstruction(VAddr base, u64 call, u64 constructor, PS4_SYSV_ABI void (*note)(VAddr),
++                      std::string_view what) {
++    // sub rsp, 0x28; mov [rsp+0x20], rdi; call <constructor>; mov [rsp+0x18], rax;
++    // mov rdi, [rsp+0x20]; mov rax, <NoteWorldMenu>; call rax; mov rax, [rsp+0x18];
++    // add rsp, 0x28; ret
++    constexpr std::array<u8, 46> Trampoline{
++        0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0x7c, 0x24, 0x20, 0xe8, 0,    0,    0,    0,    0x48, 0x89,
++        0x44, 0x24, 0x18, 0x48, 0x8b, 0x7c, 0x24, 0x20, 0x48, 0xb8, 0,    0,    0,    0,    0,    0,
++        0,    0,    0xff, 0xd0, 0x48, 0x8b, 0x44, 0x24, 0x18, 0x48, 0x83, 0xc4, 0x28, 0xc3};
++    constexpr u64 ConstructorCall = 9;
++    constexpr u64 HostCall = 24;
++    if (call == 0) {
++        return;
++    }
++    const VAddr site = base + call;
++    const VAddr target = base + constructor;
++    if (Read<u8>(site) != 0xe8 || site + 5 + Read<s32>(site + 1) != target) {
++        LOG_WARNING(Core, "Flat play: {} not made where expected ({:#x}); not followed", what, call);
++        return;
++    }
++    u8* const code = Core::AllocateModuleCode(reinterpret_cast<const void*>(base), Trampoline.size());
++    if (code == nullptr) {
++        LOG_WARNING(Core, "Flat play: no room for a trampoline; {} not followed", what);
++        return;
++    }
++    const VAddr trampoline = reinterpret_cast<VAddr>(code);
++    std::memcpy(code, Trampoline.data(), Trampoline.size());
++    Write<s32>(trampoline + ConstructorCall + 1, static_cast<s32>(target - (trampoline + ConstructorCall + 5)));
++    Write<u64>(trampoline + HostCall + 2, reinterpret_cast<u64>(note));
++    Write<s32>(site + 1, static_cast<s32>(trampoline - (site + 5)));
++    LOG_INFO(Core, "Flat play: {} followed ({:#x})", what, call);
++}
++
++bool Mapped(u64 address, u64 size) {
++    return address != 0 && (address & 3) == 0 && Core::Memory::Instance()->IsValidMapping(address, size);
++}
++
++/// The game's current physics world: the one it is busy with, which changes as it steps its
++/// rooms' worlds (a level's, and overlays' such as the pause menu's) one after another.
++u64 CurrentWorld() {
++    const Build* const build = known_build.load(std::memory_order_acquire);
++    if (build == nullptr) {
++        return 0;
++    }
++    const u64 game = Read<u64>(known_base + build->game_pointer);
++    return Mapped(game, Builds::Physics::GameWorld + 8) ? Read<u64>(game + Builds::Physics::GameWorld) : 0;
++}
++
++u64 WorldLibrary(u64 world) {
++    namespace Physics = Builds::Physics;
++    if (!Mapped(world, Physics::WorldInner + 8)) {
++        return 0;
++    }
++    const u64 inner = Read<u64>(world + Physics::WorldInner);
++    return Mapped(inner, Physics::InnerLibrary + 8) ? Read<u64>(inner + Physics::InnerLibrary) : 0;
++}
++
++/// The world the hero was last found in, its body library (to tell it is still that world) and
++/// when (steady clock, ns). In a level its world comes round as the current one many times a
++/// second; once it has not for a while (a menu, another level), it is no longer the hero's.
++std::atomic<u64> hero_world{0};
++std::atomic<u64> hero_library{0};
++std::atomic<s64> hero_world_seen{0};
++constexpr std::chrono::milliseconds HeroWorldFresh{500};
++
++/// The world the hero was found in lately while it still is, else the current one.
++u64 HeroWorld() {
++    const u64 world = hero_world.load(std::memory_order_acquire);
++    const auto seen = std::chrono::steady_clock::time_point{
++        std::chrono::nanoseconds{hero_world_seen.load(std::memory_order_acquire)}};
++    if (world != 0 && std::chrono::steady_clock::now() - seen < HeroWorldFresh &&
++        WorldLibrary(world) == hero_library.load(std::memory_order_acquire)) {
++        return world;
++    }
++    return CurrentWorld();
++}
++
++/// The hero seen from the player's head in one physics world, if it is there.
++std::optional<Vr::FlatFocus> HeroFocusIn(u64 world) {
++    namespace Physics = Builds::Physics;
++    const auto there = [](u64 address, u64 size) { return Mapped(address, size); };
++    if (!there(world, Physics::WorldInner + 8)) {
++        return std::nullopt;
++    }
++    const u64 inner = Read<u64>(world + Physics::WorldInner);
++    if (!there(inner, Physics::InnerScale + 4)) {
++        return std::nullopt;
++    }
++    const u64 library = Read<u64>(inner + Physics::InnerLibrary);
++    if (!there(library, Physics::LibraryBodies + 8)) {
++        return std::nullopt;
++    }
++    const u32 count = Read<u32>(library + Physics::LibraryBodyCount);
++    const u64 bodies = Read<u64>(library + Physics::LibraryBodies);
++    if (count <= HeroBody || !there(bodies, (HeroBody + 1) * Physics::BodySize)) {
++        return std::nullopt;
++    }
++    const auto body = [&](u32 index) { return bodies + u64{index} * Physics::BodySize; };
++    const auto motion = [&](u32 index) { return Read<u8>(body(index) + Physics::BodyMotion); };
++    if (motion(HeadFront) != HeadMotions[0] || motion(HeadMiddle) != HeadMotions[1] ||
++        motion(HeadBack) != HeadMotions[2] || motion(HeroBody) != Physics::MotionActive) {
++        return std::nullopt;
++    }
++    const auto at = [&](u32 index) {
++        const auto p = Read<std::array<float, 3>>(body(index) + Physics::BodyPosition);
++        return Vr::Vec3{p[0], p[1], p[2]};
++    };
++    const float scale = Read<float>(inner + Physics::InnerScale);
++    if (!(scale > 0.0f)) {
++        return std::nullopt;
++    }
++    const Vr::Vec3 hero = at(HeroBody);
++    // While a level starts the hero waits at the world's origin, not yet in play.
++    if (std::hypot(hero.x, hero.y, hero.z) < 0.01f) {
++        return std::nullopt;
++    }
++    const Vr::Vec3 front = at(HeadFront);
++    const Vr::Vec3 back = at(HeadBack);
++    const Vr::Vec3 middle = at(HeadMiddle);
++    const float length = std::hypot(front.x - back.x, front.y - back.y, front.z - back.z) / scale;
++    const float off_middle = std::hypot((front.x + back.x) / 2 - middle.x, (front.y + back.y) / 2 - middle.y,
++                                        (front.z + back.z) / 2 - middle.z) / scale;
++    const float size = length / HeadLength;
++    if (size < HeadSmallest || size > HeadLargest || off_middle > HeadTolerance * size) {
++        return std::nullopt;
++    }
++    const auto apart = [](const Vr::Vec3& a, const Vr::Vec3& b) {
++        return std::hypot(a.x - b.x, a.y - b.y, a.z - b.z);
++    };
++    std::optional<Vr::Vec3> rings;
++    if (count > ControllerBody && there(bodies, u64{count} * Physics::BodySize) &&
++        apart(at(ControllerBody), hero) < InControllerWithin * scale) {
++        const Vr::Vec3 controller = at(ControllerBody);
++        Vr::Vec3 sum{};
++        u32 found = 0;
++        for (u32 i = ControllerBody + 1; i < count; ++i) {
++            if (Read<u32>(body(i) + Physics::BodyKind) == GoalRingsKind && at(i).y > controller.y &&
++                apart(at(i), controller) < RingsWithin * scale) {
++                const Vr::Vec3 p = at(i);
++                sum = {sum.x + p.x, sum.y + p.y, sum.z + p.z};
++                ++found;
++            }
++        }
++        if (found != 0) {
++            rings = Vr::Vec3{sum.x / found, sum.y / found, sum.z / found};
++        }
++    }
++    return Vr::FlatFocus{.head = middle,
++                         .head_forward = {front.x - back.x, front.y - back.y, front.z - back.z},
++                         .target = hero,
++                         .units_per_metre = scale,
++                         .shot_target = rings,
++                         .controller = count > ControllerBody ? std::optional{at(ControllerBody)} : std::nullopt};
++}
++
++/// What flat play follows: the hero, seen from the player's head. The game's current world
++/// changes as it steps each room's; when the hero is not in it, the world it was last found in.
++std::optional<Vr::FlatFocus> HeroFocus() {
++    const u64 current = CurrentWorld();
++    if (const auto focus = HeroFocusIn(current)) {
++        hero_world.store(current, std::memory_order_release);
++        hero_library.store(WorldLibrary(current), std::memory_order_release);
++        hero_world_seen.store(std::chrono::steady_clock::now().time_since_epoch().count(),
++                              std::memory_order_release);
++        return focus;
++    }
++    const u64 known = HeroWorld();
++    return known != current ? HeroFocusIn(known) : std::nullopt;
++}
++
+ } // namespace
+ 
+ void OnControllerRead() {
+@@ -1639,6 +2059,19 @@ void OnGameLoaded(VAddr base, u64 size) {
+     }
+     known_base = base;
+     known_build.store(build, std::memory_order_release);
++    if (Vr::FlatMode()) {
++        HookPhysicsStep(base, *build);
++        HookConstruction(base, build->world_menu_construct_call, build->world_menu_constructor,
++                         NoteWorldMenu, "the world map's menu");
++        HookConstruction(base, build->room_construct_call, build->room_constructor, NoteRoom,
++                         "rooms (for the pause menu)");
++        Vr::SetFlatMenuView(MenuView);
++        Vr::SetFlatFocusSource([] {
++            HidePlayerModel();
++            DrawMono();
++            return Vr::FlatFollow() ? HeroFocus() : std::nullopt;
++        });
++    }
+ }
+ 
+ bool IsSceneSize(u32 width, u32 height) {
+@@ -1666,6 +2099,17 @@ bool IsSceneEnlargement(u64 pgm_hash) {
+ }
+ 
+ std::filesystem::path SceneFile(std::string_view guest_path, std::filesystem::path host_path) {
++    // A room (a level, a menu) is loaded from its own folder: .../levels/<room>/lvx/design.lvx.
++    constexpr std::string_view Levels = "/levels/";
++    constexpr std::string_view Design = "/lvx/design.lvx";
++    if (Vr::FlatMode() && guest_path.ends_with(Design)) {
++        const std::string_view folder = guest_path.substr(0, guest_path.size() - Design.size());
++        if (const auto at = folder.rfind(Levels); at != std::string_view::npos) {
++            const std::string room{folder.substr(at + Levels.size())};
++            LOG_INFO(Core, "Flat play: room {} loaded", room);
++            Vr::NoteFlatRoom(room);
++        }
++    }
+     if (!guest_path.ends_with(".spx") || !guest_path.starts_with("/app0/")) {
+         return host_path;
+     }
+diff --git a/src/core/known_title_builds.h b/src/core/known_title_builds.h
+index 11b0403..80802c5 100644
+--- a/src/core/known_title_builds.h
++++ b/src/core/known_title_builds.h
+@@ -69,6 +69,7 @@ constexpr u64 LibraryMostPairs = 0x348;  // u32
+ // One body's state.
+ constexpr u64 BodySize = 0xa0;
+ constexpr u64 BodyMotion = 0x1;    // u8
++constexpr u64 BodyKind = 0x8;      // u32: what it is, as touches go (see LevelKind)
+ constexpr u64 BodySegment = 0x30;  // s32 [3]
+ constexpr u64 BodyPosition = 0x40; // float [3]
+ constexpr u64 BodyVelocity = 0x60; // float [3]
+@@ -78,6 +79,35 @@ constexpr u8 MotionKeyframe = 2;
+ constexpr u8 MotionActive = 1;
+ } // namespace Physics
+ 
++/// The title's own display settings (its AppConfig, Display group): which picture it draws for
++/// the main display (MainDisplay: Auto picks the headset's stereo pair when there is one; Mono
++/// draws one picture from the head, to the video output, as a game without a headset does)
++/// and how much that one picture is zoomed in (MonoModeZoom). The same in every build known.
++namespace AppConfig {
++constexpr u64 MainDisplay = 0x6e8;  // pointer to the setting
++constexpr u64 MonoModeZoom = 0x700; // pointer to the setting
++constexpr u64 Value = 0x90;         // in a setting: its value
++constexpr s32 Mono = 2;
++constexpr float MonoZoomAtOne = 1.9f; // its own default: what the headset's eye shows unzoomed
++} // namespace AppConfig
++
++/// Where, in the VR player's settings, those of the player's model are (all floats, read every
++/// frame): the model's scale (<NewModel><Scale>), its cape's length and the radii of the
++/// cape's three colliders (<CapeLength>, <CapeCollisionRadius1..3>), and how much of the
++/// head's moves its base follows: across, at most how far, and up and down
++/// (<BaseXZMoveScale>, <BaseXZMoveLimit>, <BaseYMoveScale>), and how far below the head its
++/// head and base are drawn (the y of <HeadPos> and <BasePos>).
++struct PlayerModel {
++    u64 scale;
++    u64 cape_length;
++    std::array<u64, 3> cape_radii;
++    u64 base_follow;
++    u64 base_follow_limit;
++    u64 base_follow_up;
++    u64 head_height;
++    u64 base_height;
++};
++
+ struct Build {
+     /// What the log calls it.
+     const char* name;
+@@ -127,8 +157,41 @@ struct Build {
+     /// Where the hero's throw works out how far ahead of a moving target to aim
+     /// (ThrowLeadChanges).
+     std::array<Change, 2> throw_lead;
++    /// The VR player's settings (multi_platformer.xml's <VrPlayer>, a singleton): where the
++    /// pointer to them is kept, and where in them the player's model's are (PlayerModel).
++    u64 player_settings_pointer;
++    PlayerModel player_model;
++    /// Where the pointer to the title's AppConfig is kept.
++    u64 app_config_pointer;
++    /// The library's function that takes a physics step, which the end of physics_step calls
++    /// (or jumps to); flat play hooks that call to run its camera's casts right after it.
++    u64 library_step;
++    /// The game's sphere cast (Physics Effects underneath), as its own code calls it:
++    /// result* cast(result* (a SphereHit), world (the game's +0x10), const SphereQuery*).
++    u64 sphere_cast;
++    /// The world map's menu (MupVrMenu): the call that constructs it (in its factory) and the
++    /// constructor called; its vtable. 0: not known for the build.
++    u64 world_menu_construct_call;
++    u64 world_menu_constructor;
++    u64 world_menu_vtable;
++    /// The factory's call that constructs a room (a level, an overlay such as the pause menu),
++    /// the constructor called and the room's vtable. 0: not known for the build.
++    u64 room_construct_call;
++    u64 room_constructor;
++    u64 room_vtable;
+ };
+ 
++namespace WorldMenu {
++constexpr u64 State = 0x3810; // u32: its state machine's current state
++constexpr u32 Map = 2;
++constexpr u32 FlyingIn = 3;   // to a world's levels, after X
++constexpr u32 Levels = 4;     // a world's levels (the island turned by the stick)
++} // namespace WorldMenu
++
++namespace Room {
++constexpr u64 Paused = 0x195c; // u32: not 0 while the pause menu holds the room
++} // namespace Room
++
+ inline constexpr std::array<Build, 2> Known{{
+     {
+         .name = "1.00, as on the disc",
+@@ -192,6 +255,18 @@ inline constexpr std::array<Build, 2> Known{{
+         // vpermilps xmm1, xmm1, 0; vmulps xmm0, xmm8, xmm1
+         .throw_lead = {{{0x933f30, 0x008cd8080559b8c5, 0x00d349780d5eb2c5, 8},
+                         {0x933f38, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
++        .player_settings_pointer = 0x2e053c8,
++        .player_model = {.scale = 0x82b0,
++                         .cape_length = 0x8c30,
++                         .cape_radii = {0x8d90, 0x8e40, 0x8ef0},
++                         .base_follow = 0x9460,
++                         .base_follow_limit = 0x9510,
++                         .base_follow_up = 0x95c0,
++                         .head_height = 0x84c0,
++                         .base_height = 0x8780},
++        .app_config_pointer = 0x2dff8d8,
++        .library_step = 0xc72870,
++        .sphere_cast = 0xc2b340,
+     },
+     {
+         .name = "1.04, the last update",
+@@ -246,6 +321,24 @@ inline constexpr std::array<Build, 2> Known{{
+         // The same at 0x996cf0, the engine's seconds a frame at 0x17208c0.
+         .throw_lead = {{{0x996cf0, 0x008fd6d80559b8c5, 0x00d89bc80d5eb2c5, 8},
+                         {0x996cf8, 0xf8c500c90479c3c4, 0xb8c500c90479e3c4, 8}}},
++        .player_settings_pointer = 0x2ed5dc8,
++        .player_model = {.scale = 0x8620,
++                         .cape_length = 0x8fa0,
++                         .cape_radii = {0x9100, 0x91b0, 0x9260},
++                         .base_follow = 0x97d0,
++                         .base_follow_limit = 0x9880,
++                         .base_follow_up = 0x9930,
++                         .head_height = 0x8830,
++                         .base_height = 0x8af0},
++        .app_config_pointer = 0x2ecfd58,
++        .library_step = 0xcf66d0,
++        .sphere_cast = 0xcada50,
++        .world_menu_construct_call = 0xb1370b,
++        .world_menu_constructor = 0xaf5550,
++        .world_menu_vtable = 0x16e59e0,
++        .room_construct_call = 0xa48a62,
++        .room_constructor = 0xa32a50,
++        .room_vtable = 0x16dc898,
+     },
+ }};
+ 
+diff --git a/src/core/vr/flat_mode.h b/src/core/vr/flat_mode.h
+new file mode 100644
+index 0000000..938a553
+--- /dev/null
++++ b/src/core/vr/flat_mode.h
+@@ -0,0 +1,300 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <cstdlib>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "core/vr/vr_runtime.h"
++#include "input/flat_camera.h"
++
++namespace Core::Vr {
++
++/// SHADPS4_VR_FLAT=1: a title made for a headset, played on a flat screen. No headset of the
++/// machine's own is looked for, the window shows one eye filling it, and the head the title is
++/// still given is a flat game's camera (Input::FlatCamera): mounted behind what the title says
++/// to follow (FlatFocus) and swung round it with the right stick, or at the player's seat when
++/// there is nothing to follow; R3 headbutts.
++inline bool FlatMode() {
++    static const bool flat = [] {
++        const char* value = std::getenv("SHADPS4_VR_FLAT");
++        return value != nullptr && value[0] == '1';
++    }();
++    return flat;
++}
++
++/// SHADPS4_VR_FLAT_MONO=1: a title that can draw one picture instead of a headset's two (known
++/// title code switches it) does so. Off by default: such a picture is the title's own display,
++/// with a camera of its own in place of flat play's (Rescue Mission's, at 1920x1080).
++inline bool FlatMono() {
++    static const bool mono = [] {
++        const char* value = std::getenv("SHADPS4_VR_FLAT_MONO");
++        return value != nullptr && value[0] == '1';
++    }();
++    return mono;
++}
++
++/// SHADPS4_VR_FLAT_GYRO_AIM=1 (experimental): gadgets aim where the camera looks, turned on by
++/// the controller's own motion since the view was last moved with the stick.
++inline bool FlatGyroAim() {
++    static const bool gyro = [] {
++        const char* value = std::getenv("SHADPS4_VR_FLAT_GYRO_AIM");
++        return FlatMode() && value != nullptr && value[0] == '1';
++    }();
++    return gyro;
++}
++
++/// SHADPS4_VR_FLAT_FOLLOW=0: the camera stays at the player's seat instead of being mounted
++/// behind what the title says to follow (FlatFocus).
++inline bool FlatFollow() {
++    static const bool follow = [] {
++        const char* value = std::getenv("SHADPS4_VR_FLAT_FOLLOW");
++        return value == nullptr || value[0] != '0';
++    }();
++    return follow;
++}
++
++/// The camera behind the hero, from SHADPS4_VR_FLAT_SCALE (metres in a unit of its tuning: the
++/// title's hero size against Input::FlatCamera::Settings' hero), _PITCH (degrees it rests at,
++/// looking down on the hero), _SWING (degrees a second at full stick), _AUTO_TURN (degrees a
++/// second at most it turns behind a hero running across the view, 0 for not at all), _ZOOM
++/// (how much the picture is enlarged at the widest view behind the hero; menus and scenes stay
++/// as drawn) and _OPEN_EXTRA (units further out in the open; 0: no rays to gauge it either);
++/// what is not set keeps Input::FlatCamera::Settings' own.
++inline Input::FlatCamera::Settings FlatCameraSettings() {
++    Input::FlatCamera::Settings settings;
++    const auto read = [](const char* name, float& value, float scale = 1.0f) {
++        if (const char* text = std::getenv(name); text != nullptr && text[0] != '\0') {
++            value = std::strtof(text, nullptr) * scale;
++        }
++    };
++    constexpr float Radians = Input::FlatCamera::Degrees;
++    read("SHADPS4_VR_FLAT_SCALE", settings.scale);
++    read("SHADPS4_VR_FLAT_PITCH", settings.rest_pitch, Radians);
++    read("SHADPS4_VR_FLAT_SWING", settings.yaw_speed, Radians);
++    read("SHADPS4_VR_FLAT_AUTO_TURN", settings.turn_by_move, Radians);
++    read("SHADPS4_VR_FLAT_ZOOM", settings.zoom);
++    read("SHADPS4_VR_FLAT_OPEN_EXTRA", settings.open_radius_extra);
++    return settings;
++}
++
++/// Menus seen from the player's seat: SHADPS4_VR_FLAT_MENU_ROOMS (rooms, comma separated, whose
++/// view does not turn freely: the title says which room it is in, NoteFlatRoom),
++/// SHADPS4_VR_FLAT_MENU_STEPS (where in those rooms left and right step the view between:
++/// headings in degrees, to the left positive, each with a pitch up after a colon if not level;
++/// with none it faces ahead) and
++/// SHADPS4_VR_FLAT_OVERLAY_ROOMS (rooms loaded over another, which do not change the room).
++/// Also SHADPS4_VR_FLAT_ARENA_ROOMS: rooms built round the seat (a boss's), where the camera
++/// behind the hero faces the way the seat does and stands further out.
++struct FlatMenu {
++    std::vector<std::string> rooms;
++    std::vector<Input::MenuStep> steps;
++    std::vector<std::string> overlays;
++    std::vector<std::string> arenas;
++};
++
++inline FlatMenu FlatMenuSettings() {
++    FlatMenu menu;
++    const auto items = [](const char* name) {
++        std::vector<std::string> found;
++        if (const char* text = std::getenv(name); text != nullptr) {
++            std::stringstream list{text};
++            for (std::string item; std::getline(list, item, ',');) {
++                if (!item.empty()) {
++                    found.push_back(item);
++                }
++            }
++        }
++        return found;
++    };
++    menu.rooms = items("SHADPS4_VR_FLAT_MENU_ROOMS");
++    constexpr float Radians = Input::FlatCamera::Degrees;
++    for (const std::string& step : items("SHADPS4_VR_FLAT_MENU_STEPS")) {
++        char* rest = nullptr;
++        const float yaw = std::strtof(step.c_str(), &rest) * Radians;
++        const float pitch = *rest == ':' ? std::strtof(rest + 1, nullptr) * Radians : 0.0f;
++        menu.steps.push_back({yaw, pitch});
++    }
++    std::sort(menu.steps.begin(), menu.steps.end(),
++              [](const Input::MenuStep& a, const Input::MenuStep& b) { return a.yaw < b.yaw; });
++    menu.overlays = items("SHADPS4_VR_FLAT_OVERLAY_ROOMS");
++    menu.arenas = items("SHADPS4_VR_FLAT_ARENA_ROOMS");
++    return menu;
++}
++
++/// What a title says flat play is to follow, in its own world: where the player's head is
++/// there, which way it faces (its heading is what counts), where the thing to follow is, how
++/// many of the world's units make a metre of the head's tracking space, what the hero waits in
++/// the controller to be shot at, if it does, and where the controller is, if it is there.
++struct FlatFocus {
++    Vec3 head;
++    Vec3 head_forward;
++    Vec3 target;
++    float units_per_metre{1.0f};
++    std::optional<Vec3> shot_target;
++    std::optional<Vec3> controller;
++};
++
++using FlatFocusSource = std::function<std::optional<FlatFocus>()>;
++
++/// A sphere swept through a title's world from `from` to `to` (its own units): what flat play's
++/// camera asks the title's physics, to keep in front of the level's walls.
++struct FlatCast {
++    Vec3 from;
++    Vec3 to;
++    float radius{};
++};
++
++/// How far along a cast the sphere first touches the level: 0 at `from`, 1 for not at all.
++using FlatCaster = std::function<float(const FlatCast&)>;
++
++/// Which menu screen a title shows, as the title itself knows it.
++enum class FlatMenuView {
++    Title,  ///< before the menu exists (a title screen in the menu's room)
++    Map,    ///< the choice of worlds (the d-pad and the left stick step between them)
++    Levels, ///< a chosen world's levels (the camera stays on it; the d-pad acts as the stick)
++    Paused, ///< the pause menu, in any room (the view faces ahead from the seat)
++};
++
++namespace Detail {
++inline std::atomic<float> picture_zoom{1.0f};
++inline std::atomic<float> picture_dim{0.0f};
++inline std::atomic<float> pad_aim_yaw{0.0f};
++inline std::atomic<float> pad_aim_pitch{0.0f};
++inline std::atomic<bool> pad_aimed{false};
++inline std::atomic<bool> gyro_recentre{true};
++
++inline std::mutex flat_focus_mutex;
++inline FlatFocusSource flat_focus_source;
++inline std::function<std::optional<FlatMenuView>()> flat_menu_view;
++inline std::mutex flat_cast_mutex;
++inline std::vector<FlatCast> flat_casts;
++inline std::vector<float> flat_cast_results;
++inline std::mutex flat_room_mutex;
++inline std::string flat_room;
++} // namespace Detail
++
++/// For code that knows a title: the room (level, menu) it has loaded last.
++inline void NoteFlatRoom(std::string room) {
++    static const FlatMenu menu = FlatMenuSettings();
++    if (std::find(menu.overlays.begin(), menu.overlays.end(), room) != menu.overlays.end()) {
++        return;
++    }
++    std::scoped_lock lock{Detail::flat_room_mutex};
++    Detail::flat_room = std::move(room);
++}
++
++inline std::string FlatRoom() {
++    std::scoped_lock lock{Detail::flat_room_mutex};
++    return Detail::flat_room;
++}
++
++/// For the camera (the controller's thread): the casts to run when the title's physics next can.
++inline void RequestFlatCasts(std::vector<FlatCast> casts) {
++    std::scoped_lock lock{Detail::flat_cast_mutex};
++    Detail::flat_casts = std::move(casts);
++}
++
++/// For the camera: what the casts last run found, in the order they were asked for (a frame
++/// late); empty before any has run.
++inline std::vector<float> FlatCastResults() {
++    std::scoped_lock lock{Detail::flat_cast_mutex};
++    return Detail::flat_cast_results;
++}
++
++/// For code that knows a title, on the title's own thread when its physics stand still between
++/// steps: runs the casts asked for.
++inline void RunFlatCasts(const FlatCaster& cast) {
++    std::vector<FlatCast> casts;
++    {
++        std::scoped_lock lock{Detail::flat_cast_mutex};
++        casts = Detail::flat_casts;
++    }
++    std::vector<float> results;
++    results.reserve(casts.size());
++    for (const FlatCast& c : casts) {
++        results.push_back(cast(c));
++    }
++    std::scoped_lock lock{Detail::flat_cast_mutex};
++    Detail::flat_cast_results = std::move(results);
++}
++
++/// For code that knows a title: which screen its menu room shows (nothing: not known).
++inline void SetFlatMenuView(std::function<std::optional<FlatMenuView>()> view) {
++    std::scoped_lock lock{Detail::flat_focus_mutex};
++    Detail::flat_menu_view = std::move(view);
++}
++
++inline std::optional<FlatMenuView> ReadFlatMenuView() {
++    std::function<std::optional<FlatMenuView>()> view;
++    {
++        std::scoped_lock lock{Detail::flat_focus_mutex};
++        view = Detail::flat_menu_view;
++    }
++    return view ? view() : std::nullopt;
++}
++
++/// For code that knows a title: what its flat play follows. Asked from the controller's thread.
++inline void SetFlatFocusSource(FlatFocusSource source) {
++    std::scoped_lock lock{Detail::flat_focus_mutex};
++    Detail::flat_focus_source = std::move(source);
++}
++
++/// How much the picture shown is to be enlarged around its middle.
++inline void NotePictureZoom(float zoom) {
++    Detail::picture_zoom.store(zoom, std::memory_order_relaxed);
++}
++
++/// Where flat play has the controller point when nothing tracks it (a title made for a headset
++/// aims gadgets with it): where the camera looks.
++inline void NotePadAim(float yaw, float pitch) {
++    Detail::pad_aim_yaw.store(yaw, std::memory_order_relaxed);
++    Detail::pad_aim_pitch.store(pitch, std::memory_order_relaxed);
++    Detail::pad_aimed.store(true, std::memory_order_release);
++}
++
++/// The controller's attitude now is where its motion aims from (the view was moved).
++inline void RecentrePadGyro() {
++    Detail::gyro_recentre.store(true, std::memory_order_relaxed);
++}
++
++inline bool TakePadGyroRecentre() {
++    return Detail::gyro_recentre.exchange(false, std::memory_order_relaxed);
++}
++
++inline std::optional<std::pair<float, float>> PadAim() {
++    if (!Detail::pad_aimed.load(std::memory_order_acquire)) {
++        return std::nullopt;
++    }
++    return std::pair{Detail::pad_aim_yaw.load(std::memory_order_relaxed),
++                     Detail::pad_aim_pitch.load(std::memory_order_relaxed)};
++}
++
++inline float PictureZoom() {
++    return Detail::picture_zoom.load(std::memory_order_relaxed);
++}
++
++/// How far the picture shown is faded to black (0 to 1).
++inline void NotePictureDim(float dim) {
++    Detail::picture_dim.store(dim, std::memory_order_relaxed);
++}
++
++inline float PictureDim() {
++    return Detail::picture_dim.load(std::memory_order_relaxed);
++}
++
++inline std::optional<FlatFocus> ReadFlatFocus() {
++    std::scoped_lock lock{Detail::flat_focus_mutex};
++    return Detail::flat_focus_source ? Detail::flat_focus_source() : std::nullopt;
++}
++
++} // namespace Core::Vr
+diff --git a/src/core/vr/openxr_host.cpp b/src/core/vr/openxr_host.cpp
+index f64f5d0..1be9e28 100644
+--- a/src/core/vr/openxr_host.cpp
++++ b/src/core/vr/openxr_host.cpp
+@@ -28,6 +28,7 @@
+ #include "common/singleton.h"
+ #include "common/thread.h"
+ #include "core/known_title.h"
++#include "core/vr/flat_mode.h"
+ #include "core/vr/late_frame_wait.h"
+ #include "core/vr/openxr_host.h"
+ #include "input/controller.h"
+@@ -2747,7 +2748,7 @@ void OpenXrHost::Shutdown() {
+ }
+ 
+ bool OpenXrHost::Connect() {
+-    impl->enabled = EnvFlag("SHADPS4_OPENXR", true);
++    impl->enabled = EnvFlag("SHADPS4_OPENXR", true) && !FlatMode();
+     impl->track_hands = EnvFlag("SHADPS4_XR_HANDS", true);
+     impl->feed_head = EnvFlag("SHADPS4_XR_HEAD", true);
+     // (A script that plays the game is the gamepad: nothing else has a say then.)
+diff --git a/src/core/vr/vr_runtime.cpp b/src/core/vr/vr_runtime.cpp
+index b7c3820..46aa315 100644
+--- a/src/core/vr/vr_runtime.cpp
++++ b/src/core/vr/vr_runtime.cpp
+@@ -17,6 +17,7 @@
+ #include "core/vr/headset_fov_cache.h"
+ #include "core/vr/vr_host_link.h"
+ #include "core/vr/vr_runtime.h"
++#include "core/vr/flat_mode.h"
+ #ifdef ENABLE_OPENXR_HOST
+ #include "core/vr/openxr_host.h"
+ #endif
+@@ -192,6 +193,11 @@ Runtime& Runtime::Instance() {
+ void Runtime::Configure(bool psvr_supported, bool psvr_required) {
+     const FileConfig file_config = LoadFileConfig();
+     config = file_config.config;
++    // On a flat screen the head is a camera that moves about; the controller stays in the
++    // player's hands at the seat instead of riding along with it.
++    if (FlatMode()) {
++        config.pad_follows_head = false;
++    }
+     if (std::ifstream file{OwnPadPlacePath()}; file) {
+         const auto json = nlohmann::json::parse(file, nullptr, false);
+         if (const auto it = json.is_object() ? json.find("own_place") : json.end();
+@@ -281,7 +287,10 @@ void Runtime::RecenterSeatLocked() {
+     if (!host_head.tracked) {
+         return;
+     }
+-    const Quat yaw = YawOnly(host_head.pose.orientation);
++    // On a flat screen the head is a camera that moves about: its own space is the seat, and
++    // a reset of the view must not make wherever it was straight ahead.
++    const Pose rest = FlatMode() ? Pose{} : host_head.pose;
++    const Quat yaw = YawOnly(rest.orientation);
+     if (seat_valid && pad_attitude_valid) {
+         // The controller keeps pointing where it points: its heading is counted from the new
+         // straight ahead.
+@@ -297,7 +306,7 @@ void Runtime::RecenterSeatLocked() {
+     previous_seat_position = seat_position;
+     previous_seat_yaw = seat_yaw;
+     seat_changed = std::chrono::steady_clock::now();
+-    seat_position = host_head.pose.position;
++    seat_position = rest.position;
+     seat_yaw = yaw;
+     seat_valid = true;
+     view_turn = 0.0f;
+@@ -1012,7 +1021,21 @@ DeviceState Runtime::GetPad() {
+     if (seen) {
+         state.linear_velocity = pad_seen_velocity;
+     }
+-    if (pad.sequence != 0) {
++    // On a flat screen gadgets aim where the camera looks, even with a gamepad's motion sensors:
++    // a controller lying on a table would otherwise hold the aim where it happens to point.
++    // With FlatGyroAim, the controller's turns since the view was last moved aim on from there.
++    if (const auto aim = FlatMode() ? PadAim() : std::nullopt) {
++        const Quat view = FromYawPitch(aim->first, aim->second);
++        if (FlatGyroAim() && pad.sequence != 0) {
++            if (TakePadGyroRecentre()) {
++                pad_gyro_rest = pad.pose.orientation;
++            }
++            state.pose.orientation = Normalize(Multiply(view, Multiply(Conjugate(pad_gyro_rest), pad.pose.orientation)));
++            state.angular_velocity = pad.angular_velocity;
++        } else {
++            state.pose.orientation = view;
++        }
++    } else if (pad.sequence != 0) {
+         state.pose.orientation = pad.pose.orientation;
+         state.angular_velocity = pad.angular_velocity;
+     }
+diff --git a/src/core/vr/vr_runtime.h b/src/core/vr/vr_runtime.h
+index 6210761..664e185 100644
+--- a/src/core/vr/vr_runtime.h
++++ b/src/core/vr/vr_runtime.h
+@@ -324,6 +324,8 @@ private:
+     std::chrono::steady_clock::time_point pad_host_pose_time;
+     // Smoothed point the untracked controller hangs off.
+     Vec3 pad_anchor;
++    // The controller's attitude its motion aims from (FlatGyroAim).
++    Quat pad_gyro_rest;
+     bool pad_anchor_valid{};
+     // The player's own place for it, from that point, and whether it is there.
+     Vec3 own_pad_offset{0.0f, -0.30f, -0.45f};
+diff --git a/src/imgui/fade_picture_layer.cpp b/src/imgui/fade_picture_layer.cpp
+new file mode 100644
+index 0000000..5f5e6b6
+--- /dev/null
++++ b/src/imgui/fade_picture_layer.cpp
+@@ -0,0 +1,55 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <cstdlib>
++#include <imgui.h>
++
++#include "core/vr/flat_mode.h"
++#include "imgui/fade_picture_layer.h"
++#include "imgui/imgui_layer.h"
++#include "imgui/imgui_texture.h"
++
++namespace ImGui::FadePicture {
++namespace {
++
++/// The picture in the middle of the screen, as opaque as the picture under it is dark.
++class Layer final : public ImGui::Layer {
++public:
++    explicit Layer(const char* path) : picture{RefCountedTexture::DecodePngFile(path)} {
++        AddLayer(this);
++    }
++
++    void Draw() override {
++        const float dim = ::Core::Vr::PictureDim();
++        const auto image = picture.GetTexture();
++        if (dim <= 0.0f || image.im_id == nullptr) {
++            return;
++        }
++        static constexpr float ScreenShare = 1.0f / 3.0f; // of the screen's height, the picture's
++        const ImVec2 screen = GetIO().DisplaySize;
++        const float side = screen.y * ScreenShare;
++        const ImVec2 from{(screen.x - side) / 2, (screen.y - side) / 2};
++        GetForegroundDrawList()->AddImage(image.im_id, from, {from.x + side, from.y + side}, {0, 0}, {1, 1},
++                                          IM_COL32(255, 255, 255, static_cast<int>(255 * dim)));
++    }
++
++    // Drawn over the title's own frames only: no frames of its own (which would be the last one
++    // shown again each vblank, in the way of the title's).
++    bool ShouldKeepDrawing() override {
++        return false;
++    }
++
++private:
++    RefCountedTexture picture;
++};
++
++} // namespace
++
++void Start() {
++    static const char* const path = std::getenv("SHADPS4_VR_FLAT_FADE_PICTURE");
++    if (path != nullptr && path[0] != '\0') {
++        static Layer layer{path};
++    }
++}
++
++} // namespace ImGui::FadePicture
+diff --git a/src/imgui/fade_picture_layer.h b/src/imgui/fade_picture_layer.h
+new file mode 100644
+index 0000000..8074147
+--- /dev/null
++++ b/src/imgui/fade_picture_layer.h
+@@ -0,0 +1,12 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++namespace ImGui::FadePicture {
++
++/// Flat play's picture over its fade to black (SHADPS4_VR_FLAT_FADE_PICTURE: a PNG), from then
++/// on; nothing without one. Once ImGui is up.
++void Start();
++
++} // namespace ImGui::FadePicture
+diff --git a/src/input/controller.cpp b/src/input/controller.cpp
+index ef348c6..76e18a5 100644
+--- a/src/input/controller.cpp
++++ b/src/input/controller.cpp
+@@ -6,12 +6,15 @@
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
++#include <limits>
+ #include <mutex>
+ #include <unordered_set>
+ #include <utility>
+ 
+ #include <SDL3/SDL.h>
+ 
++#include "common/elf_info.h"
++#include "core/vr/flat_mode.h"
+ #include "common/logging/log.h"
+ #include "common/singleton.h"
+ #include "core/emulator_settings.h"
+@@ -20,6 +23,7 @@
+ #include "core/user_settings.h"
+ #include "core/vr/vr_runtime.h"
+ #include "input/controller.h"
++#include "input/scripted_input.h"
+ 
+ namespace Input {
+ 
+@@ -99,6 +103,23 @@ int GameController::ReadStates(State* states, int states_num) {
+ }
+ 
+ /// A VR host drives the real controller of the first player.
++static const Core::Vr::FlatMenu& TitleMenu() {
++    static const Core::Vr::FlatMenu menu = Core::Vr::FlatMenuSettings();
++    return menu;
++}
++
++/// Whether the room loaded is one of the title's menus (the camera at the seat, stepping).
++static bool InMenuRoom() {
++    const auto& rooms = TitleMenu().rooms;
++    return std::find(rooms.begin(), rooms.end(), Core::Vr::FlatRoom()) != rooms.end();
++}
++
++/// Whether the room loaded is built round the seat (a boss's arena).
++static bool InArenaRoom() {
++    const auto& arenas = TitleMenu().arenas;
++    return std::find(arenas.begin(), arenas.end(), Core::Vr::FlatRoom()) != arenas.end();
++}
++
+ static bool IsFirstController(const GameController* controller) {
+     return (*Common::Singleton<GameControllers>::Instance())[0] == controller;
+ }
+@@ -122,6 +143,17 @@ void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
+     if (HeadsetPlays()) {
+         return;
+     }
++    // On a world's levels the d-pad picks a level as the left stick does.
++    if ((button == OrbisPadButtonDataOffset::Left || button == OrbisPadButtonDataOffset::Right) &&
++        Core::Vr::FlatMode() && InMenuRoom() && Core::Vr::ReadFlatMenuView() == Core::Vr::FlatMenuView::Levels) {
++        static constexpr int StickLeft = 0;
++        static constexpr int StickRight = 255;
++        static constexpr int StickCentre = 128;
++        Axis(Input::Axis::LeftX,
++             !is_pressed ? StickCentre : button == OrbisPadButtonDataOffset::Left ? StickLeft : StickRight,
++             false);
++        return;
++    }
+     OrbisPadButtonDataOffset before;
+     OrbisPadButtonDataOffset after;
+     {
+@@ -221,14 +253,107 @@ void GameController::SetHeadsetPlays(bool plays) {
+     }
+ }
+ 
++void GameController::UpdateFlatCamera() {
++    auto& runtime = Core::Vr::Runtime::Instance();
++    if (!Core::Vr::FlatMode() || !runtime.IsHeadsetConnected()) {
++        return;
++    }
++    // The pad state, not the SDL gamepad: keys bound to the stick steer as well.
++    static constexpr float AxisCentre = 128.0f;
++    static constexpr float AxisHalfRange = 127.0f;
++    const auto stick = [&](Input::Axis across, Input::Axis up) {
++        return FlatCamera::Stick{(m_state.axes[std::to_underlying(across)] - AxisCentre) / AxisHalfRange,
++                                 (AxisCentre - m_state.axes[std::to_underlying(up)]) / AxisHalfRange};
++    };
++    FlatCamera::Stick look, move;
++    int menu_step;
++    bool menu_home;
++    bool follow_controller;
++    bool pad_pressed;
++    {
++        std::lock_guard lock{m_state_mutex};
++        look = stick(Input::Axis::RightX, Input::Axis::RightY);
++        move = stick(Input::Axis::LeftX, Input::Axis::LeftY);
++        menu_step = (True(m_state.buttonsState & OrbisPadButtonDataOffset::Right) ? 1 : 0) -
++                    (True(m_state.buttonsState & OrbisPadButtonDataOffset::Left) ? 1 : 0);
++        menu_home = True(m_state.buttonsState & OrbisPadButtonDataOffset::Cross);
++        // L2 held: the camera follows the controller (the right stick aims it, the left still
++        // moves the hero) instead of the hero.
++        follow_controller = True(m_state.buttonsState & OrbisPadButtonDataOffset::L2);
++        pad_pressed = True(m_state.buttonsState & OrbisPadButtonDataOffset::TouchPad);
++    }
++    if (pad_pressed != m_pad_blows) {
++        m_pad_blows = pad_pressed;
++        Input::SetBlowing(pad_pressed);
++    }
++    const double now =
++        std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    std::optional<TrackVec> hero;
++    std::optional<TrackVec> shot_at;
++    if (const auto seen = Core::Vr::ReadFlatFocus()) {
++        const auto vec = [](const Core::Vr::Vec3& v) { return TrackVec{v.x, v.y, v.z}; };
++        m_flat_world.Update(now, vec(seen->head), vec(seen->head_forward), seen->units_per_metre);
++        hero = m_flat_world.ToTrack(vec(follow_controller && seen->controller ? *seen->controller : seen->target));
++        if (seen->shot_target) {
++            shot_at = m_flat_world.ToTrack(vec(*seen->shot_target));
++        }
++    } else {
++        m_flat_world.Reset();
++    }
++    // The menu's own screen, where the title says: a title screen, a world's levels and the
++    // pause menu (in any room) face ahead without steps; on the map the left stick steps as
++    // the d-pad does.
++    static constexpr float StickStep = 0.5f;
++    using Core::Vr::FlatMenuView;
++    const auto title_view = Core::Vr::ReadFlatMenuView();
++    const bool paused = title_view == FlatMenuView::Paused;
++    const bool fixed = paused || InMenuRoom();
++    const auto view = fixed ? title_view : std::nullopt;
++    std::span<const MenuStep> steps = TitleMenu().steps;
++    int step = menu_step;
++    if (view == FlatMenuView::Title || view == FlatMenuView::Levels || paused) {
++        steps = {};
++        step = 0;
++    } else if (view == FlatMenuView::Map && step == 0 && std::abs(move.x) > StickStep) {
++        step = move.x > 0.0f ? 1 : -1;
++    }
++    const std::vector<float> hits = Core::Vr::FlatCastResults();
++    if (std::hypot(look.x, look.y) > FlatCamera::StickDeadZone) {
++        Core::Vr::RecentrePadGyro(); // the view was moved: the controller aims on from it
++    }
++    const FlatCamera::Head head = m_flat_camera.Update(now, look, move, hero, hits,
++                                                       {.fixed = fixed, .steps = steps, .step = step, .home = menu_home},
++                                                       menu_step, shot_at, InArenaRoom() && !follow_controller);
++    std::vector<Core::Vr::FlatCast> casts;
++    if (m_flat_world.Valid()) {
++        const auto world = [&](const TrackVec& v) {
++            const TrackVec w = m_flat_world.ToWorld(v);
++            return Core::Vr::Vec3{w.x, w.y, w.z};
++        };
++        for (const FlatCamera::Cast& c : m_flat_camera.Casts()) {
++            casts.push_back({world(c.from), world(c.to), c.radius * m_flat_world.Scale()});
++        }
++    }
++    Core::Vr::RequestFlatCasts(std::move(casts));
++    m_flat_world.NotePose(now, head.position, head.yaw);
++    Core::Vr::NotePictureZoom(head.zoom);
++    Core::Vr::NotePictureDim(head.dim);
++    // A title made for a headset aims its gadgets (and picks) with where the controller
++    // points: with nothing tracking it, that is where the camera looks.
++    Core::Vr::NotePadAim(head.yaw, head.pitch);
++    Core::Vr::Pose pose;
++    pose.orientation = Core::Vr::FromYawPitch(head.yaw, head.pitch);
++    pose.position = {head.position.x, head.position.y, head.position.z};
++    runtime.UpdateHead({.pose = pose, .tracked = true});
++}
+ void GameController::UpdateStickTouch() {
+     // A controller without a touchpad of its own (or whose touchpad nobody touches): the right
+     // stick moves a finger over it (see StickFinger for how). Titles made for a headset have
+     // their players swipe and drag, and have no use for a second stick.
+-    // SHADPS4_STICK_TOUCHPAD=0 leaves the stick a stick.
++    // SHADPS4_STICK_TOUCHPAD=0 leaves the stick a stick, and so does a stick that steers the head.
+     static const bool enabled = [] {
+         const char* value = std::getenv("SHADPS4_STICK_TOUCHPAD");
+-        return value == nullptr || value[0] != '0';
++        return (value == nullptr || value[0] != '0') && !Core::Vr::FlatMode();
+     }();
+     if (m_sdl_gamepad == nullptr || !Core::Vr::Runtime::Instance().IsHeadsetConnected() ||
+         HeadsetPlays()) {
+@@ -239,8 +364,9 @@ void GameController::UpdateStickTouch() {
+     // of the right stick to a side turns the view a step that way (see ViewTurn), for players
+     // who cannot turn round where they sit. The stick moves no finger meanwhile. (Not while
+     // the PS button is held: it gives the shoulder buttons another meaning.)
++    // (Not on a flat screen: the stick turns the camera there, and a turn of the view would stay.)
+     const bool turning =
+-        SDL_GetGamepadButton(m_sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) &&
++        !Core::Vr::FlatMode() && SDL_GetGamepadButton(m_sdl_gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) &&
+         !SDL_GetGamepadButton(m_sdl_gamepad, SDL_GAMEPAD_BUTTON_GUIDE);
+     if (const int steps = m_view_turn.Update(
+             turning, static_cast<float>(SDL_GetGamepadAxis(m_sdl_gamepad, SDL_GAMEPAD_AXIS_RIGHTX)) /
+@@ -326,6 +452,7 @@ void GameController::PollState() {
+     // This is called every few milliseconds for every controller, whatever it has to say.
+     if (IsFirstController(this)) {
+         Core::Vr::Runtime::Instance().PollViewGestures();
++        UpdateFlatCamera();
+         UpdateStickTouch();
+     }
+ }
+diff --git a/src/input/controller.h b/src/input/controller.h
+index 886a615..1778672 100644
+--- a/src/input/controller.h
++++ b/src/input/controller.h
+@@ -17,6 +17,8 @@
+ #include "core/libraries/system/userservice.h"
+ #include "input/pad_gestures.h"
+ #include "input/stick_finger.h"
++#include "core/vr/flat_mode.h"
++#include "input/flat_camera.h"
+ #include "input/view_turn.h"
+ 
+ namespace Input {
+@@ -140,6 +142,8 @@ private:
+     void ApplyTouch(int touch_index, bool touch_down, float x, float y);
+     /// Lets the right stick stand in for a finger on the touchpad (see controller.cpp).
+     void UpdateStickTouch();
++    /// Steers the head on a flat screen like a flat game's camera (see Core::Vr::FlatMode).
++    void UpdateFlatCamera();
+ 
+     u8 m_next_touch_id{1};
+     u64 m_touch_down_timestamp{};
+@@ -155,6 +159,12 @@ private:
+     bool m_gesture_press = false;
+     // The left shoulder button held, the stick turns the view instead (see ViewTurn).
+     ViewTurn m_view_turn;
++    FlatCamera m_flat_camera{Core::Vr::FlatCameraSettings()};
++    // The touchpad pressed also blows into the microphone (a streamed game hears no microphone;
++    // only what wants a blow, near and looked at, takes it).
++    bool m_pad_blows = false;
++    // Where the title's world sits for the camera.
++    WorldPlacement m_flat_world;
+     bool m_stick_touch = false;
+     float m_stick_touch_x = 0.5f;
+     float m_stick_touch_y = 0.5f;
+diff --git a/src/input/flat_camera.h b/src/input/flat_camera.h
+new file mode 100644
+index 0000000..b96dfad
+--- /dev/null
++++ b/src/input/flat_camera.h
+@@ -0,0 +1,942 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cmath>
++#include <numbers>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
++
++namespace Input {
++
++/// A position in the head's tracking space: metres, +X right, +Y up, -Z ahead of the seat the
++/// title puts the player in. Yaw turns to the left, pitch up.
++struct TrackVec {
++    float x{};
++    float y{};
++    float z{};
++};
++
++inline float Wrap(float angle) {
++    return std::remainder(angle, 2.0f * std::numbers::pi_v<float>);
++}
++
++inline float Blend(float step, float time) {
++    return 1.0f - std::exp(-step / time);
++}
++
++/// Where a title's own world sits in the head's tracking space, worked out from where the
++/// title says the head is in its world and how it faces there, against the pose the head was
++/// given when the title took it: titles answer a frame or two late, so the poses given are
++/// kept a while and the one from then is used. Lightly smoothed after that, so that the title
++/// carrying the player's seat along a level is followed at once.
++class WorldPlacement {
++public:
++    static constexpr float SettleTime = 0.05f;
++    /// How long after a pose is given the title reports the head where it put it.
++    static constexpr double TitleLag = 0.033;
++    static constexpr std::size_t History = 64;
++
++    /// What the head was given at `now`.
++    void NotePose(double now, const TrackVec& pose, float yaw) {
++        given[next] = {now, pose, yaw};
++        next = (next + 1) % History;
++        count = std::min(count + 1, History);
++    }
++
++    /// `head`, `head_forward`: in the world, as the title says now; `units_per_metre`: of it.
++    void Update(double now, const TrackVec& head, const TrackVec& head_forward, float units_per_metre) {
++        const Given then = GivenAt(now - TitleLag);
++        const float step = valid ? static_cast<float>(std::clamp(now - last, 0.0, 0.1)) : 0.0f;
++        last = now;
++        const float yaw = Wrap(std::atan2(-head_forward.x, -head_forward.z) - then.yaw);
++        const float blend = valid ? Blend(step, SettleTime) : 1.0f;
++        turn = Wrap(turn + Wrap(yaw - turn) * blend);
++        scale = units_per_metre;
++        // The world point the tracking space's origin is at.
++        const TrackVec turned = Turn(then.pose, turn);
++        const TrackVec seen{head.x - turned.x * scale, head.y - turned.y * scale, head.z - turned.z * scale};
++        origin.x += (seen.x - origin.x) * blend;
++        origin.y += (seen.y - origin.y) * blend;
++        origin.z += (seen.z - origin.z) * blend;
++        valid = true;
++    }
++
++    /// A point of the world, in the head's tracking space.
++    TrackVec ToTrack(const TrackVec& world) const {
++        return Turn({(world.x - origin.x) / scale, (world.y - origin.y) / scale, (world.z - origin.z) / scale},
++                    -turn);
++    }
++
++    /// A point of the head's tracking space, in the world.
++    TrackVec ToWorld(const TrackVec& track) const {
++        const TrackVec turned = Turn(track, turn);
++        return {origin.x + turned.x * scale, origin.y + turned.y * scale, origin.z + turned.z * scale};
++    }
++
++    /// The world's units in a metre of tracking space.
++    float Scale() const {
++        return scale;
++    }
++
++    bool Valid() const {
++        return valid;
++    }
++
++    void Reset() {
++        valid = false;
++    }
++
++    /// Turns a vector about +Y, to the left for a positive angle.
++    static TrackVec Turn(const TrackVec& v, float angle) {
++        const float c = std::cos(angle);
++        const float s = std::sin(angle);
++        return {v.x * c + v.z * s, v.y, -v.x * s + v.z * c};
++    }
++
++private:
++    struct Given {
++        double time{};
++        TrackVec pose;
++        float yaw{};
++    };
++
++    /// The latest pose given no later than `time`, or the oldest kept.
++    Given GivenAt(double time) const {
++        Given found{};
++        bool any = false;
++        for (std::size_t i = 0; i < count; ++i) {
++            const Given& g = given[(next + History - 1 - i) % History];
++            found = g;
++            any = true;
++            if (g.time <= time) {
++                break;
++            }
++        }
++        return any ? found : Given{};
++    }
++
++    std::array<Given, History> given{};
++    std::size_t next{};
++    std::size_t count{};
++    double last{};
++    float turn{};
++    float scale{1.0f};
++    TrackVec origin;
++    bool valid{};
++};
++
++/// Where a menu's view can look: a heading (to the left positive) and a pitch (up positive).
++struct MenuStep {
++    float yaw{};
++    float pitch{};
++};
++
++/// A menu seen from the seat that is not to be turned freely (the stick is the title's there):
++/// it faces ahead, or one of `steps` (from right to left) that a press left or right moves
++/// between; `home` turns it back to the step straight ahead (where a title brings what is
++/// picked).
++struct SeatMenu {
++    bool fixed{};
++    std::span<const MenuStep> steps;
++    int step{}; // -1 left held, 1 right held, 0 neither
++    bool home{};
++};
++
++/// The head of a title made for a headset, played on a flat screen, as the camera of a flat
++/// platformer (Astro Bot's, docs/camera-port.md). With a hero to follow it orbits a point above
++/// them. The right stick turns it and it stays turned; while the hero runs sideways (the move
++/// stick across) it turns by itself to follow them, so one stick is enough to play; left alone,
++/// its pitch eases back to a resting one as the hero moves on. The higher it looks down from,
++/// the further out it sits and the wider it sees. It follows the ground the hero stands on
++/// rather than their jumps, and walls pull it in at once (casts through the title's physics,
++/// a frame late) and let it out slowly, only while the player plays. All of it is tuned in units
++/// of the hero's size (Settings::scale metres each). With nothing to follow (menus, scenes) it
++/// goes back to the player's seat and the right stick turns the view round freely. A hero has to
++/// be there a moment before it is followed and gone a moment before it is let go, so that a
++/// scene changing over does not move the camera. A held button pushes the head forward: a
++/// headbutt, which a title tells from a nod by its speed.
++class FlatCamera {
++public:
++    using Vec = TrackVec;
++    struct Stick {
++        float x{}; // right positive
++        float y{}; // up positive
++    };
++    using Menu = SeatMenu;
++    struct Head {
++        float yaw{};
++        float pitch{};
++        Vec position;
++        float zoom{1.0f}; // of the picture shown: the title's own field of view is wide
++        float dim{};      // of the picture shown, to black: over a fall to the end
++    };
++    /// A sphere swept through the world, in tracking space; what it finds comes back as how far
++    /// along it first touches something (0 to 1; 1 for nothing).
++    struct Cast {
++        Vec from;
++        Vec to;
++        float radius{};
++    };
++    static constexpr float Degrees = std::numbers::pi_v<float> / 180.0f;
++    /// What can be set per title (Core::Vr::FlatCameraSettings reads it). Lengths are in units
++    /// of `scale` metres, angles in radians, pitch positive looking down on the hero.
++    struct Settings {
++        float scale = 1.0f;
++        float radius_near = 0.4f; // looking along the ground
++        float radius_far = 2.0f;  // looking straight down
++        float fov_near = 60.0f * Degrees;
++        float fov_far = 50.0f * Degrees;
++        /// The point orbited, from the hero: across, up, back (towards the camera).
++        Vec offset_near{0.0f, 0.28f, 0.0f};
++        Vec offset_far{0.0f, 0.5f, 0.0f};
++        float hero_height = 0.25f;
++        float pitch_min = -40.0f * Degrees;
++        float pitch_max = 80.0f * Degrees;
++        float start_pitch = 20.0f * Degrees;
++        float rest_pitch = 20.0f * Degrees;
++        float yaw_speed = 90.0f * Degrees;    // a second at full stick
++        float pitch_speed = 80.0f * Degrees;  // a second at full stick
++        float turn_by_move = 60.0f * Degrees; // a second, running sideways at full stick
++        float zoom = 1.0f; // how much the picture is enlarged at the widest view (1: not)
++        /// In an arena (a room built round the seat: a boss's) the camera faces the way the
++        /// seat does and stands this much further out.
++        float arena_radius_extra = 1.0f;
++        /// In the open (nothing round the hero) the camera stands this much further out; by
++        /// walls, less (the 2024 game's levels let it out by up to this much).
++        float open_radius_extra = 1.0f;
++    };
++    /// How the camera frames the hero at a pitch: metres out, picture enlargement.
++    struct Framing {
++        float share{}; // of the way from the near framing to the far one
++        float radius{};
++        float zoom{1.0f};
++    };
++
++    FlatCamera() = default;
++    explicit FlatCamera(const Settings& settings) : settings{settings} {}
++
++    static constexpr float StickDeadZone = 0.15f;
++    // At the seat: radians a second at full stick, and how far up or down it looks at most.
++    static constexpr float SeatTurnSpeed = 1.8f;
++    static constexpr float SeatTiltSpeed = 1.2f;
++    static constexpr float MaxSeatPitch = 1.2f;
++    static constexpr float ReturnTime = 0.5f;
++    static constexpr float FollowAfter = 0.5f; // seconds a hero is seen before it is followed
++    static constexpr float LeaveAfter = 0.3f;  // seconds it is gone before it is let go
++    static constexpr float MountTime = 0.15f;
++    static constexpr float MountSettleTime = 0.7f; // the move from the seat is eased this long
++    // Behind the hero. A filter is the share kept each sixtieth of a second.
++    static constexpr float LookFilter = 0.86f;
++    static constexpr float MoveFilter = 0.8f;
++    static constexpr float PitchSoftBand = 20.0f * Degrees; // slows the stick near a pitch limit
++    static constexpr float RestAfter = 0.5f;    // seconds without the camera stick
++    static constexpr float RestDuration = 1.5f; // seconds of full move stick to rest the pitch
++    static constexpr float SharePower = 0.9f;
++    static constexpr float FollowXZ = 0.85f;
++    static constexpr float FollowY = 0.95f;
++    static constexpr float FollowFastSpeed = 5.0f; // units a second: the hero followed at once
++    static constexpr float FollowFastPower = 3.0f;
++    static constexpr float CloseIn = 0.85f;     // share pulled in past which height follows sooner
++    static constexpr float NearShare = 0.5f;    // framing share below which height follows sooner
++    static constexpr float HeadPoint = 0.7f;    // of the hero's height: what walls pull towards
++    static constexpr float VelocityTime = 0.1f; // seconds the hero's speed is smoothed over
++    // The ground under the hero, which the camera's height follows instead of jumps.
++    static constexpr float GroundCastLength = 10.0f;
++    static constexpr float GroundCastLift = 0.1f;
++    static constexpr float GroundedGap = 0.1f;
++    static constexpr float GroundRise = 0.92f;
++    static constexpr float FallStart = 0.85f;
++    static constexpr float FallEnd = 0.5f;
++    static constexpr float FallDelay = 0.2f;
++    static constexpr float FallDuration = 0.5f;
++    static constexpr float LostBelow = 0.5f; // seconds to the hero's height with no ground found
++    static constexpr float LostAbove = 10.0f;
++    static constexpr float HeightSpanFar = 3.0f;
++    static constexpr float HeightSpanNear = 0.1f;
++    static constexpr float HeightOffset = 0.35f;
++    static constexpr float LowShare = 0.3f; // pitch share below which height follows the hero
++    // Walls.
++    static constexpr float CastRadius = 0.05f;
++    static constexpr float CastAcross = 8.0f * Degrees; // the four casts' spread, across
++    static constexpr float CastUp = 4.5f * Degrees;     // and up and down
++    static constexpr float OutFilter = 0.92f;
++    static constexpr float HoldIn = 0.1f;    // seconds of play before it lets out
++    static constexpr float EaseOut = 0.1f;   // seconds over which it starts to
++    static constexpr float PlayRise = 0.7f;  // filters of how much is being played
++    static constexpr float PlayFall = 0.93f;
++    /// Nearest a wall pulls it to the point it orbits: closer it would be inside the hero, whom
++    /// a title made for a headset cannot fade out as a flat game does.
++    static constexpr float NearestOut = 0.3f;
++
++    static constexpr float ZoomTime = 0.4f;
++    static constexpr float LeanSpeed = 2.0f;
++    /// A held lean moves the head to the side this far (dodging what a title throws at it).
++    static constexpr float LeanDistance = 0.3f;
++    /// After a shot: slower than this (metres a second) for this long (seconds) is at rest.
++    static constexpr float RestSpeed = 0.2f;
++    /// A target to be shot at swings at least this far (metres); one that does not is not one.
++    static constexpr float SwingAtLeast = 0.5f;
++    /// In an arena: the time to turn to the seat's way.
++    static constexpr float ArenaTurnTime = 1.0f;
++    /// Side-on: beyond this far from the seat (units), running at this speed at least (units a
++    /// second) this many times more across the seat's line than along it, this long (seconds),
++    /// the view turns to the line (settling in about the 2024 game's Duration2D, 2 s: three of
++    /// SideTurnTime); along it this long, it is let go.
++    static constexpr float SideFrom = 1.0f;
++    static constexpr float SideSpeed = 0.3f;
++    static constexpr float SideRatio = 2.0f;
++    static constexpr float SideAfter = 0.5f;
++    static constexpr float SideLeaveAfter = 1.0f;
++    static constexpr float SideTurnTime = 0.67f;
++    /// Units from where it belongs beyond which the camera goes there at once, not eased.
++    static constexpr float SnapBeyond = 3.0f;
++    /// A fall this far below where the hero stood (units) is to the end: the picture fades out
++    /// over FadeInTime, stays dark until DarkAfter past their return and fades back over
++    /// FadeOutTime (seconds).
++    static constexpr float FadeBelow = 8.0f;
++    static constexpr float FadeInTime = 0.4f;
++    static constexpr float DarkAfter = 0.4f;
++    static constexpr float FadeOutTime = 0.5f;
++    /// The extra distance (an arena's, the open's) is eased in and out slowly.
++    static constexpr float RadiusExtraFilter = 0.98f;
++    /// The casts: the ground's first, then the walls behind the camera, then the rays round the
++    /// hero that tell how open it is (this far out, units; below this share free, enclosed).
++    static constexpr std::size_t FirstWallCast = 1;
++    static constexpr std::size_t WallCasts = 4;
++    static constexpr std::size_t FirstOpenCast = FirstWallCast + WallCasts;
++    static constexpr std::size_t OpenCasts = 8;
++    static constexpr float OpenReach = 3.0f;
++    static constexpr float OpenAbove = 1.0f;
++    static constexpr float EnclosedBelow = 0.5f;
++    /// Falling: this far (units) below where the hero last stood, with no floor under them.
++    static constexpr float FallingDrop = 1.0f;
++    static constexpr float FloorNear = 3.0f; // units: a floor further under a falling hero is none
++    static constexpr float FallingSpeed = 5.0f; // units a second down; slower is sinking (water)
++    static constexpr float FallWatchTurnTime = 1.0f;
++    /// Seconds on a floor far below before the hero is taken up there (the end, below, takes
++    /// them back sooner).
++    static constexpr float LandedAfterFall = 1.0f;
++    static constexpr float StillAfterFall = 2.0f;
++    static constexpr float StillWithin = 0.15f; // units
++    static constexpr float RestedAfterShot = 0.5f;
++    /// Longer gaps between updates (a stall) do not count as time to move in.
++    static constexpr double MaxStep = 0.1;
++
++    /// `now` in seconds; the sticks from -1 to 1; `hero` where the hero is in tracking space, if
++    /// there is one to follow; `hits` what the casts asked for last (Casts) found; `shot_at` a
++    /// target the hero waits in the controller to be shot at (a title's catapult), if any;
++    /// `arena` whether the room is built round the seat (a boss's).
++    Head Update(double now, Stick look, Stick move, std::optional<Vec> hero_at,
++                std::span<const float> hits = {}, Menu menu = {}, int lean_held = 0,
++                std::optional<Vec> shot_at = std::nullopt, bool arena = false) {
++        const float step = started ? static_cast<float>(std::clamp(now - last, 0.0, MaxStep)) : 0.0f;
++        started = true;
++        last = now;
++        in_arena = arena;
++        const float open_extra = OpenShare() * settings.open_radius_extra;
++        radius_extra = Keep(radius_extra, std::max(arena ? settings.arena_radius_extra : 0.0f, open_extra),
++                            RadiusExtraFilter, step);
++
++        look = DeadZoned(look);
++        move = DeadZoned(move);
++        if (hero_at) {
++            seen_for += step;
++            gone_for = 0.0f;
++            last_seen = *hero_at;
++        } else {
++            gone_for += step;
++            seen_for = 0.0f;
++        }
++        float zoom = 1.0f;
++        casts.clear();
++        if (menu.fixed) {
++            shot = std::nullopt;
++            InMenu(step, menu);
++        } else if (Shooting(step, hero_at, shot_at)) {
++            AtShot(step);
++        } else if (watching_fall && !hero_at) {
++            // A hero lost at their end (a title may stop saying where they are): held where it is.
++        } else if (mounted ? gone_for < LeaveAfter : seen_for >= FollowAfter) {
++            zoom = Mount(step, look, move, last_seen, hits);
++        } else {
++            Seat(step, look);
++        }
++        head.zoom += (zoom - head.zoom) * Blend(step, ZoomTime);
++        FadeAtTheEnd(step, hero_at.has_value());
++        const float lean_target = menu.fixed ? 0.0f : static_cast<float>(lean_held) * LeanDistance;
++        lean += std::clamp(lean_target - lean, -LeanSpeed * step, LeanSpeed * step);
++        head.position = {mount.x + std::cos(head.yaw) * lean, mount.y, mount.z - std::sin(head.yaw) * lean};
++        return head;
++    }
++
++    const Head& Last() const {
++        return head;
++    }
++
++    /// The casts to run for the next update: the ground under the hero, then the walls behind
++    /// the camera (none at the seat).
++    const std::vector<Cast>& Casts() const {
++        return casts;
++    }
++
++    /// The point a mounted camera orbits.
++    Vec LookPoint() const {
++        return orbited;
++    }
++
++    Framing Frame(float at_pitch) const {
++        const float share = std::pow(
++            std::clamp((at_pitch - settings.pitch_min) / (settings.pitch_max - settings.pitch_min), 0.0f, 1.0f),
++            SharePower);
++        const float fov = Mix(settings.fov_near, settings.fov_far, share);
++        const float widest = std::max(settings.fov_near, settings.fov_far);
++        return {share, (Mix(settings.radius_near, settings.radius_far, share) + radius_extra) * settings.scale,
++                settings.zoom * std::tan(widest / 2) / std::tan(fov / 2)};
++    }
++
++private:
++    static float Mix(float a, float b, float t) {
++        return a + (b - a) * t;
++    }
++
++    static Vec Mix(const Vec& a, const Vec& b, float t) {
++        return {Mix(a.x, b.x, t), Mix(a.y, b.y, t), Mix(a.z, b.z, t)};
++    }
++
++    /// The share kept of `x` for a filter keeping `keep` each sixtieth of a second.
++    static float Keep(float x, float target, float keep, float step) {
++        const float k = std::pow(std::max(keep, 0.0f), 60.0f * step);
++        return k * x + (1.0f - k) * target;
++    }
++
++    static float Ease(float u) {
++        return 0.5f * (1.0f - std::cos(std::numbers::pi_v<float> * std::clamp(u, 0.0f, 1.0f)));
++    }
++
++    static Stick DeadZoned(Stick s) {
++        const float length = std::hypot(s.x, s.y);
++        if (length <= StickDeadZone) {
++            return {};
++        }
++        const float scale = std::min(1.0f, (length - StickDeadZone) / (1.0f - StickDeadZone)) / length;
++        return {s.x * scale, s.y * scale};
++    }
++
++    static void Approach(Vec& from, const Vec& to, float blend) {
++        from.x += (to.x - from.x) * blend;
++        from.y += (to.y - from.y) * blend;
++        from.z += (to.z - from.z) * blend;
++    }
++
++    /// From the point orbited out to the camera, at a yaw and pitch.
++    static Vec Back(float yaw, float pitch) {
++        return {std::sin(yaw) * std::cos(pitch), std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
++    }
++
++    /// Returns the picture's enlargement.
++    float Mount(float step, Stick look, Stick move, const Vec& seen, std::span<const float> hits) {
++        const float unit = settings.scale;
++        if (!mounted) {
++            hero = pivot = seen;
++            velocity = {};
++            yaw = brought_back ? 0.0f : std::atan2(-(seen.x - mount.x), -(seen.z - mount.z));
++            brought_back = false;
++            pitch = settings.start_pitch;
++            ground = seen.y;
++            // Taken up again while seen falling (a title may lose sight of a hero at its end): the
++            // fall is still being watched.
++            if (!watching_fall) {
++                stood = seen.y;
++            }
++            intrusion = played = blocked_for = 0.0f;
++            look_in = {};
++            turn_in = 0.0f;
++            idle_for = 0.0f;
++            resting = false;
++            mounted_for = 0.0f;
++            side_on = side_turned = false;
++            across_for = along_for = 0.0f;
++            radius = Frame(pitch).radius;
++            mounted = true;
++        }
++        mounted_for += step;
++        if (step > 0.0f) {
++            const Vec moved{(seen.x - hero.x) / step, (seen.y - hero.y) / step, (seen.z - hero.z) / step};
++            Approach(velocity, moved, Blend(step, VelocityTime));
++        }
++        hero = seen;
++        ReadOpenness(hits);
++        if (WatchFall(step, hits)) {
++            return head.zoom;
++        }
++
++        Rotate(step, look, move);
++        FollowGround(step, hits);
++
++        const Framing frame = Frame(pitch);
++        if (frame.radius < radius) {
++            intrusion = std::max(0.0f, intrusion - (radius - frame.radius));
++        }
++        radius = frame.radius;
++        Follow(step, frame.share);
++
++        const Vec offset = Mix(Mix(settings.offset_near, settings.offset_far, frame.share),
++                               Vec{0.0f, HeadPoint * settings.hero_height, 0.0f}, intrusion / radius);
++        const float c = std::cos(yaw);
++        const float s = std::sin(yaw);
++        orbited = {pivot.x + (offset.x * c + offset.z * s) * unit, pivot.y + offset.y * unit,
++                   pivot.z + (-offset.x * s + offset.z * c) * unit};
++
++        KeepClear(step, look, move, hits);
++        if (settings.open_radius_extra > 0.0f) {
++            CastOpenness();
++        }
++
++        const Vec back = Back(yaw, pitch);
++        const float out = radius - intrusion;
++        const Vec target{orbited.x + back.x * out, orbited.y + back.y * out, orbited.z + back.z * out};
++        // (Far from where it belongs, as after a hero is brought back, it goes there at once: it
++        // would slide through the level.)
++        if (mounted_for < MountSettleTime &&
++            std::hypot(target.x - mount.x, target.y - mount.y, target.z - mount.z) < SnapBeyond * unit) {
++            Approach(mount, target, Blend(step, MountTime));
++        } else {
++            mount = target;
++        }
++        const Vec to{orbited.x - mount.x, orbited.y - mount.y, orbited.z - mount.z};
++        head.yaw = std::atan2(-to.x, -to.z);
++        head.pitch = std::atan2(to.y, std::hypot(to.x, to.z));
++        look_yaw = head.yaw;
++        look_pitch = head.pitch;
++        return frame.zoom;
++    }
++
++    /// A side-on stretch: the hero running across the line from the player's seat (the tracking
++    /// space's origin; the levels were made to be seen from there) to them, as along a wall or
++    /// round the seat. Held while they stand; let go once they run along the line a while (which
++    /// also starts a new stretch after the player turned the view themselves).
++    void SideOn(float step) {
++        const float unit = settings.scale;
++        const float out = std::hypot(hero.x, hero.z);
++        if (out < SideFrom * unit || std::hypot(velocity.x, velocity.z) < SideSpeed * unit) {
++            return;
++        }
++        const float along = (velocity.x * hero.x + velocity.z * hero.z) / out;
++        const float across = std::abs(velocity.x * hero.z - velocity.z * hero.x) / out;
++        const bool sideways = across > SideRatio * std::abs(along);
++        across_for = sideways ? across_for + step : 0.0f;
++        along_for = sideways ? 0.0f : along_for + step;
++        if (across_for >= SideAfter && !side_turned) {
++            side_on = true;
++        } else if (along_for >= SideLeaveAfter) {
++            side_on = side_turned = false;
++        }
++    }
++
++    /// The camera stick turns it; the move stick across turns it after a hero running sideways
++    /// (side-on, it turns to the line from the seat instead); left alone while the hero moves,
++    /// its pitch eases back to rest.
++    void Rotate(float step, Stick look, Stick move) {
++        const float unit = settings.scale;
++        look_in.x = Keep(look_in.x, look.x, LookFilter, step);
++        look_in.y = Keep(look_in.y, look.y, LookFilter, step);
++        const float speed = std::hypot(velocity.x, velocity.z) / unit;
++        const float turn = move.x * std::min(speed, 1.0f) * (1.0f - std::abs(look.x)) * (1.0f - std::abs(move.y) / 2);
++        turn_in = Keep(turn_in, turn, MoveFilter, step);
++        const float across = std::abs(velocity.x * std::cos(yaw) - velocity.z * std::sin(yaw)) / unit;
++        if (look.x != 0.0f) {
++            // The player's own turn is theirs: no side-on view until the next stretch.
++            side_on = false;
++            side_turned = true;
++        }
++        SideOn(step);
++        if (in_arena) {
++            yaw = Wrap(yaw + Wrap(-yaw) * Blend(step, ArenaTurnTime));
++        } else if (side_on) {
++            yaw = Wrap(yaw + Wrap(std::atan2(-hero.x, -hero.z) - yaw) * Blend(step, SideTurnTime));
++        } else {
++            yaw = Wrap(yaw - (settings.yaw_speed * look_in.x + settings.turn_by_move * std::min(across, 1.0f) * turn_in) *
++                                 step);
++        }
++
++        const float tilt = -settings.pitch_speed * look_in.y * step;
++        const float room = tilt < 0.0f ? pitch - settings.pitch_min : settings.pitch_max - pitch;
++        pitch = std::clamp(pitch + tilt * std::min(1.0f, std::max(room, 0.0f) / PitchSoftBand), settings.pitch_min,
++                           settings.pitch_max);
++
++        if (look.x != 0.0f || look.y != 0.0f) {
++            idle_for = 0.0f;
++            resting = false;
++            return;
++        }
++        idle_for += step;
++        if (idle_for < RestAfter) {
++            return;
++        }
++        if (!resting) {
++            resting = true;
++            rest_from = pitch;
++            rested = 0.0f;
++        }
++        rested += step * std::hypot(move.x, move.y);
++        pitch = Mix(rest_from, settings.rest_pitch, Ease(rested / RestDuration));
++    }
++
++    /// The height the camera follows: the ground under the hero, not their jumps.
++    /// A fall to the end (far below, or the hero lost while falling) fades the picture to black
++    /// and keeps it so until a while after they are back (the camera has gone to them unseen),
++    /// as the 2024 game does round its respawn.
++    void FadeAtTheEnd(float step, bool seen) {
++        const float unit = settings.scale;
++        const bool at_the_end = watching_fall && (!seen || hero.y < stood - FadeBelow * unit);
++        dark_for = at_the_end ? DarkAfter : std::max(0.0f, dark_for - step);
++        const bool dark = at_the_end || dark_for > 0.0f;
++        head.dim = dark ? std::min(1.0f, head.dim + step / FadeInTime) : std::max(0.0f, head.dim - step / FadeOutTime);
++    }
++
++    /// The floor under the hero the ground cast found (its sphere's stop, less its radius).
++    std::optional<float> Floor(std::span<const float> hits) const {
++        if (hits.empty() || hits[0] >= 1.0f || casts_sent.empty()) {
++            return std::nullopt;
++        }
++        const Cast& down = casts_sent[0];
++        return down.from.y + (down.to.y - down.from.y) * hits[0] - down.radius;
++    }
++
++    void CastGround() {
++        const float unit = settings.scale;
++        casts.push_back({{hero.x, hero.y + GroundCastLift * unit, hero.z},
++                         {hero.x, hero.y - GroundCastLength * unit, hero.z},
++                         CastRadius * unit});
++    }
++
++    /// A hero dropping fast (not sinking in water) well below where they last stood with no floor
++    /// near under them is falling to their end (or far down): the camera keeps its height, goes on
++    /// across with them and turns down to watch them go (as the 2024 game's FallDeath camera
++    /// does), until they are back where they fell from (brought back), have stood a while on a
++    /// floor down there or have been still longer (on something the cast does not find, as
++    /// water), and are taken up.
++    bool WatchFall(float step, std::span<const float> hits) {
++        const float unit = settings.scale;
++        const std::optional<float> floor = Floor(hits);
++        if (!watching_fall) {
++            const bool near_floor = floor && hero.y - *floor < FloorNear * unit;
++            watching_fall = !near_floor && hero.y < stood - FallingDrop * unit && velocity.y < -FallingSpeed * unit;
++            if (!watching_fall) {
++                return false;
++            }
++            landed_for = still_for = 0.0f;
++            fall_last = hero;
++            fall_across = {mount.x - hero.x, 0.0f, mount.z - hero.z};
++        } else {
++            const bool grounded = floor && hero.y - *floor < GroundedGap * unit;
++            landed_for = grounded ? landed_for + step : 0.0f;
++            // Still: staying near one place (bobbing on water counts).
++            if (std::hypot(hero.x - fall_last.x, hero.y - fall_last.y, hero.z - fall_last.z) < StillWithin * unit) {
++                still_for += step;
++            } else {
++                fall_last = hero;
++                still_for = 0.0f;
++            }
++            if (hero.y >= stood - FallingDrop * unit || landed_for >= LandedAfterFall ||
++                still_for >= StillAfterFall) {
++                // Taken up again at once (not after FollowAfter, from the seat); brought back to
++                // where they fell from, facing the way the seat does, not from where the fall
++                // was watched.
++                brought_back = hero.y >= stood - FallingDrop * unit;
++                watching_fall = false;
++                mounted = false;
++                seen_for = FollowAfter;
++                return true;
++            }
++        }
++        CastGround();
++        casts_sent = casts;
++        mount = {hero.x + fall_across.x, mount.y, hero.z + fall_across.z};
++        const Vec to{hero.x - mount.x, hero.y - mount.y, hero.z - mount.z};
++        look_yaw = Wrap(look_yaw + Wrap(std::atan2(-to.x, -to.z) - look_yaw) * Blend(step, FallWatchTurnTime));
++        look_pitch += (std::atan2(to.y, std::hypot(to.x, to.z)) - look_pitch) * Blend(step, FallWatchTurnTime);
++        head.yaw = look_yaw;
++        head.pitch = look_pitch;
++        return true;
++    }
++
++    void FollowGround(float step, std::span<const float> hits) {
++        const float unit = settings.scale;
++        const std::optional<float> floor = Floor(hits);
++        if (!floor) {
++            // Eased from where it is each update, sooner the longer nothing is found.
++            lost_for += step / (hero.y <= ground ? LostBelow : LostAbove);
++            ground = Mix(ground, hero.y, Ease(lost_for));
++        } else if (hero.y - *floor < GroundedGap * unit) {
++            ground = stood = hero.y;
++            fallen_for = lost_for = 0.0f;
++        } else if (*floor > ground) {
++            ground = Keep(ground, *floor, GroundRise, step);
++            fallen_for = lost_for = 0.0f;
++        } else if (hero.y < ground) {
++            lost_for = 0.0f;
++            fallen_for += step;
++            const float keep = fallen_for < FallDelay
++                                   ? FallStart
++                                   : Mix(FallStart, FallEnd, Ease((fallen_for - FallDelay) / FallDuration));
++            ground = Keep(ground, hero.y, keep, step);
++        }
++        CastGround();
++    }
++
++    /// Moves the point followed after the hero (a step ahead of them), soon when they are fast.
++    void Follow(float step, float share) {
++        const float unit = settings.scale;
++        const float pitch_share = (pitch - settings.pitch_min) / (settings.pitch_max - settings.pitch_min);
++        const float in = intrusion / radius;
++        const float weight = std::max(pitch_share < LowShare ? 1.0f - pitch_share / LowShare : 0.0f, in);
++        const float span = Mix(HeightSpanFar, HeightSpanNear, weight) * unit;
++        const float off = (1.0f - weight) * HeightOffset * unit;
++        const float rise = std::clamp((hero.y - off - ground) / span, 0.0f, 1.0f);
++        const float height = ground + std::sin(rise * std::numbers::pi_v<float> / 2) * (hero.y - ground);
++
++        float across = 1.0f - std::pow(std::min(std::hypot(velocity.x, velocity.z) / unit / FollowFastSpeed, 1.0f),
++                                      FollowFastPower);
++        float up = 1.0f - std::pow(std::min(std::max(0.0f, -velocity.y) / unit / FollowFastSpeed, 1.0f),
++                                  FollowFastPower);
++        if (in > CloseIn) {
++            up *= (1.0f - in) / (1.0f - CloseIn);
++        }
++        if (share < NearShare) {
++            up *= share / NearShare;
++        }
++        pivot.x = Keep(pivot.x, hero.x + velocity.x * step, across * FollowXZ, step);
++        pivot.z = Keep(pivot.z, hero.z + velocity.z * step, across * FollowXZ, step);
++        pivot.y = Keep(pivot.y, height, up * FollowY, step);
++    }
++
++    /// Pulls the camera in at once to what the casts behind it left clear, and lets it out
++    /// slowly, only while the player plays.
++    void KeepClear(float step, Stick look, Stick move, std::span<const float> hits) {
++        const float unit = settings.scale;
++        float needed = 0.0f;
++        for (std::size_t i = FirstWallCast; i < std::min(hits.size(), FirstWallCast + WallCasts); ++i) {
++            needed = std::max(needed, radius * (1.0f - hits[i]));
++        }
++        needed = std::min(needed, std::max(0.0f, radius - NearestOut * unit));
++        if (intrusion <= needed) {
++            intrusion = needed;
++            blocked_for = 0.0f;
++        } else {
++            const float playing = std::max(std::hypot(look.x, look.y), std::hypot(move.x, move.y));
++            played = Keep(played, playing, playing > played ? PlayRise : PlayFall, step);
++            blocked_for += step * played;
++            const float easing = std::clamp((blocked_for - HoldIn) / EaseOut, 0.0f, 1.0f);
++            intrusion = std::min(Keep(intrusion, needed, OutFilter + (1.0f - OutFilter) * (1.0f - easing * played), step),
++                                 radius);
++        }
++        const float length = radius / (std::cos(CastAcross / 2) * std::cos(CastUp / 2));
++        for (const float across : {-CastAcross / 2, CastAcross / 2}) {
++            for (const float up : {-CastUp / 2, CastUp / 2}) {
++                const Vec way = Back(yaw + across, pitch + up);
++                casts.push_back({orbited,
++                                 {orbited.x + way.x * length, orbited.y + way.y * length, orbited.z + way.z * length},
++                                 CastRadius * unit});
++            }
++        }
++        casts_sent = casts;
++    }
++
++    /// How open the space round the hero is: how far, on the whole, rays out from above them (over
++    /// railings and steps, not over walls) went before something stopped them (the last update's,
++    /// before any are sent anew).
++    void ReadOpenness(std::span<const float> hits) {
++        if (casts_sent.size() == FirstOpenCast + OpenCasts && hits.size() >= FirstOpenCast + OpenCasts) {
++            float sum = 0.0f;
++            for (std::size_t i = FirstOpenCast; i < FirstOpenCast + OpenCasts; ++i) {
++                sum += hits[i];
++            }
++            openness = sum / OpenCasts;
++        }
++    }
++
++    /// The rays for the next update's openness.
++    void CastOpenness() {
++        const float unit = settings.scale;
++        const Vec from{hero.x, hero.y + OpenAbove * unit, hero.z};
++        for (std::size_t i = 0; i < OpenCasts; ++i) {
++            const float heading = 2.0f * std::numbers::pi_v<float> * static_cast<float>(i) / OpenCasts;
++            casts.push_back({from,
++                             {from.x + std::sin(heading) * OpenReach * unit, from.y,
++                              from.z + std::cos(heading) * OpenReach * unit},
++                             CastRadius * unit});
++        }
++        casts_sent = casts;
++    }
++
++    /// Of the camera's extra distance in the open: none with walls about (a corridor), all of it
++    /// with nothing round the hero.
++    float OpenShare() const {
++        return std::clamp((openness - EnclosedBelow) / (1.0f - EnclosedBelow), 0.0f, 1.0f);
++    }
++
++    void InMenu(float step, const Menu& menu) {
++        const std::span<const MenuStep> steps = menu.steps;
++        mounted = false;
++        Approach(mount, {}, Blend(step, ReturnTime));
++        MenuStep heading;
++        if (!steps.empty()) {
++            if (chosen >= steps.size()) {
++                chosen = 0;
++                for (std::size_t i = 1; i < steps.size(); ++i) {
++                    if (std::abs(Wrap(steps[i].yaw - look_yaw)) < std::abs(Wrap(steps[chosen].yaw - look_yaw))) {
++                        chosen = i;
++                    }
++                }
++            }
++            if (menu.step != 0 && menu.step != last_step) {
++                const std::size_t count = steps.size();
++                chosen = (chosen + (menu.step > 0 ? count - 1 : 1)) % count;
++            }
++            last_step = menu.step;
++            if (menu.home) {
++                for (std::size_t i = 0; i < steps.size(); ++i) {
++                    if (std::abs(steps[i].yaw) < std::abs(steps[chosen].yaw)) {
++                        chosen = i;
++                    }
++                }
++            }
++            heading = steps[chosen];
++        }
++        look_yaw = Wrap(look_yaw + Wrap(heading.yaw - look_yaw) * Blend(step, ReturnTime));
++        look_pitch += (heading.pitch - look_pitch) * Blend(step, ReturnTime);
++        head.yaw = look_yaw;
++        head.pitch = look_pitch;
++    }
++
++    /// The target's sweep so far, and how long the hero has rested since it went.
++    struct Shot {
++        Vec low;
++        Vec high;
++        float rested{};
++    };
++
++    /// A shot is watched from the seat once its target has been seen swinging, while it is
++    /// there and, once the hero has gone (shot), until it rests again wherever it comes down.
++    bool Shooting(float step, const std::optional<Vec>& hero_at, const std::optional<Vec>& shot_at) {
++        if (!shot_at && shot && !Swinging()) {
++            shot = std::nullopt;
++        }
++        if (shot_at) {
++            if (!shot) {
++                shot = Shot{*shot_at, *shot_at};
++            }
++            shot->low = {std::min(shot->low.x, shot_at->x), std::min(shot->low.y, shot_at->y),
++                         std::min(shot->low.z, shot_at->z)};
++            shot->high = {std::max(shot->high.x, shot_at->x), std::max(shot->high.y, shot_at->y),
++                          std::max(shot->high.z, shot_at->z)};
++            shot->rested = 0.0f;
++        } else if (shot && hero_at && step > 0.0f) {
++            const bool still = std::hypot(hero_at->x - shot_hero.x, hero_at->y - shot_hero.y,
++                                          hero_at->z - shot_hero.z) < RestSpeed * step;
++            shot->rested = still ? shot->rested + step : 0.0f;
++            if (shot->rested >= RestedAfterShot) {
++                shot = std::nullopt;
++            }
++        }
++        if (hero_at) {
++            shot_hero = *hero_at;
++        }
++        return shot && Swinging();
++    }
++
++    bool Swinging() const {
++        return std::hypot(shot->high.x - shot->low.x, shot->high.y - shot->low.y, shot->high.z - shot->low.z) >=
++               SwingAtLeast;
++    }
++
++    /// From the seat, facing the middle of what the target has swept (where a shot is aimed).
++    void AtShot(float step) {
++        mounted = false;
++        chosen = NoneChosen;
++        Approach(mount, {}, Blend(step, ReturnTime));
++        const Vec middle{(shot->low.x + shot->high.x) / 2, (shot->low.y + shot->high.y) / 2,
++                         (shot->low.z + shot->high.z) / 2};
++        const Vec to{middle.x - mount.x, middle.y - mount.y, middle.z - mount.z};
++        look_yaw = Wrap(look_yaw + Wrap(std::atan2(-to.x, -to.z) - look_yaw) * Blend(step, ReturnTime));
++        look_pitch += (std::atan2(to.y, std::hypot(to.x, to.z)) - look_pitch) * Blend(step, ReturnTime);
++        head.yaw = look_yaw;
++        head.pitch = look_pitch;
++    }
++
++    void Seat(float step, Stick look) {
++        mounted = false;
++        chosen = NoneChosen;
++        Approach(mount, {}, Blend(step, ReturnTime));
++        // Carries on from where the head looked; the stick turns it from there.
++        look_yaw = Wrap(look_yaw - look.x * SeatTurnSpeed * step);
++        look_pitch = std::clamp(look_pitch + look.y * SeatTiltSpeed * step, -MaxSeatPitch, MaxSeatPitch);
++        head.yaw = look_yaw;
++        head.pitch = look_pitch;
++    }
++
++    Settings settings;
++    bool mounted{};
++    float seen_for{};
++    float gone_for{};
++    float mounted_for{};
++    Vec last_seen;
++    Vec hero;
++    Vec velocity;
++    Vec pivot;
++    Vec orbited;
++    Vec mount;
++    float yaw{};
++    float pitch{};
++    float radius{};
++    float intrusion{};
++    float played{};
++    float blocked_for{};
++    Stick look_in;
++    float turn_in{};
++    float idle_for{};
++    bool resting{};
++    float rest_from{};
++    float rested{};
++    float ground{};
++    float fallen_for{};
++    float lost_for{};
++    std::vector<Cast> casts;
++    std::vector<Cast> casts_sent;
++    static constexpr std::size_t NoneChosen = static_cast<std::size_t>(-1);
++    std::size_t chosen{NoneChosen};
++    int last_step{};
++    float look_yaw{};
++    float look_pitch{};
++    float lean{};
++    std::optional<Shot> shot;
++    bool in_arena{};
++    bool side_on{};
++    bool side_turned{};
++    float across_for{};
++    float along_for{};
++    float radius_extra{};
++    float openness{};
++    float stood{};
++    bool watching_fall{};
++    bool brought_back{};
++    float landed_for{};
++    float dark_for{};
++    float still_for{};
++    Vec fall_last;
++    Vec fall_across; // from the hero to the camera, across, as the fall began
++    Vec shot_hero;
++    Head head;
++    double last{};
++    bool started{};
++};
++
++} // namespace Input
+diff --git a/src/video_core/host_shaders/post_process.frag b/src/video_core/host_shaders/post_process.frag
+index c291f79..4b747dc 100644
+--- a/src/video_core/host_shaders/post_process.frag
++++ b/src/video_core/host_shaders/post_process.frag
+@@ -24,6 +24,8 @@ layout (push_constant) uniform settings {
+     // picture is sharpened by sharpen_centre instead: where FSR 1 enlarged the title's scene.
+     float sharpen_centre;
+     float centre_radius;
++    // How far the picture is faded to black (0: not at all, 1: black).
++    float dim;
+ } pp;
+ 
+ const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
+@@ -64,6 +66,7 @@ void main() {
+         here = clamp(((above + below + left + right) * weight + here) / (1.0 + 4.0 * weight),
+                      0.0, 1.0);
+     }
++    here *= 1.0 - pp.dim;
+     if (pp.linear_out && !pp.hdr) {
+         // Back to linear light, by the curve the target encodes with.
+         here = mix(pow((here + 0.055) / 1.055, vec3(2.4)), here / 12.92,
+diff --git a/src/video_core/renderer_vulkan/host_passes/pp_pass.h b/src/video_core/renderer_vulkan/host_passes/pp_pass.h
+index 4597619..7af28b0 100644
+--- a/src/video_core/renderer_vulkan/host_passes/pp_pass.h
++++ b/src/video_core/renderer_vulkan/host_passes/pp_pass.h
+@@ -32,6 +32,8 @@ public:
+         /// scene, which leaves it crisp already (TitleUpscale). 0: no such part.
+         float sharpen_centre = 0.0f;
+         float centre_radius = 0.0f;
++        /// 0..1: how far the picture is faded to black (flat play's, Core::Vr::PictureDim).
++        float dim = 0.0f;
+     };
+ 
+     void Create(vk::Device device, vk::Format surface_format);
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
+index b67be7d..070069d 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -12,10 +12,12 @@
+ #include "core/libraries/system/systemservice.h"
+ #include "imgui/friends_layer.h"
+ #include "imgui/invitation_prompt_layer.h"
++#include "core/vr/flat_mode.h"
+ #include "core/vr/spectator_view.h"
+ #ifdef ENABLE_OPENXR_HOST
+ #include "core/vr/openxr_host.h"
+ #endif
++#include "imgui/fade_picture_layer.h"
+ #include "imgui/notifications_layer.h"
+ #include "imgui/renderer/imgui_core.h"
+ #include "imgui/renderer/imgui_impl_vulkan.h"
+@@ -1173,12 +1175,15 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
+     const bool exported = frame != nullptr;
+     static const auto desktop_view = [] {
+         const char* value = std::getenv("SHADPS4_VR_DESKTOP_VIEW");
++        if (value == nullptr && Core::Vr::FlatMode()) {
++            return Core::Vr::DesktopView::Spectator;
++        }
+         return Core::Vr::ParseDesktopView(value != nullptr ? value : "");
+     }();
+     const bool spectator = desktop_view != Core::Vr::DesktopView::Stereo && !exported;
+     static const bool desktop_crop = [] {
+         const char* value = std::getenv("SHADPS4_VR_DESKTOP_CROP");
+-        return value != nullptr && std::string_view{value} == "1";
++        return value != nullptr ? std::string_view{value} == "1" : Core::Vr::FlatMode();
+     }();
+     const bool crop = spectator && desktop_crop;
+     const float desktop_aspect = Core::Vr::DesktopViewAspect(
+@@ -1324,6 +1329,10 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
+     }();
+     auto hmd_settings = pp_settings;
+     hmd_settings.sharpen = sharpen;
++    hmd_settings.dim = Core::Vr::FlatMode() ? Core::Vr::PictureDim() : 0.0f;
++    if (Core::Vr::FlatMode()) {
++        ImGui::FadePicture::Start();
++    }
+     hmd_settings.encoded_in = encoded_in ? 1 : 0;
+     // Where FSR 1 enlarged the title's scene (TitleUpscale), the picture is crisp already:
+     // sharpened by SHADPS4_VR_SHARPEN_FSR there (half of the rest by default).
+@@ -1365,9 +1374,17 @@ HmdFrames Presenter::PrepareHmdFrame(std::span<const AmdGpu::Image, 2> eye_textu
+             const auto count = layout[1].clip_width == 0 ? 1u : 2u;
+             pp_pass.Render(cmdbuf, std::span{regions}.first(count), *frame, hmd_settings);
+         } else if (spectator) {
++            // Enlarged around the middle for flat play (Core::Vr::PictureZoom).
++            const float zoom = Core::Vr::FlatMode() ? std::max(1.0f, Core::Vr::PictureZoom()) : 1.0f;
++            const auto zoomed_width = static_cast<u32>(content.extent.width * zoom);
++            const auto zoomed_height = static_cast<u32>(content.extent.height * zoom);
++            const vk::Rect2D zoomed{
++                {content.offset.x + (static_cast<s32>(content.extent.width) - static_cast<s32>(zoomed_width)) / 2,
++                 content.offset.y + (static_cast<s32>(content.extent.height) - static_cast<s32>(zoomed_height)) / 2},
++                {zoomed_width, zoomed_height}};
+             const std::array regions{
+                 HostPasses::PostProcessingPass::Region{
+-                    .input = eye_views[0], .area = content, .clip = clip},
++                    .input = eye_views[0], .area = zoomed, .clip = clip},
+             };
+             pp_pass.Render(cmdbuf, regions, *frame, hmd_settings);
+         } else {
+diff --git a/tools/tests/flat_camera_test.cpp b/tools/tests/flat_camera_test.cpp
+new file mode 100644
+index 0000000..8a07542
+--- /dev/null
++++ b/tools/tests/flat_camera_test.cpp
+@@ -0,0 +1,716 @@
++// Checks the head a title made for a headset gets on a flat screen. At the seat: the stick turns
++// the view freely, the headbutt goes out and back at its speed, a stall does not jump the head.
++// Behind a hero (the flat platformer camera): it orbits a point above them at the distance its
++// pitch calls for; the camera stick turns it and it stays; running sideways with the move
++// stick turns it after the hero, running at it does not; its pitch rests back only while the
++// hero moves; a wall behind it pulls it in at once and it lets out only while played; its
++// height follows the ground, not jumps. The world's placement in tracking space comes out
++// right from what a title says of the head. A catapult's shot is watched from the seat.
++//
++//   clang++ -std=c++20 -I src tools/tests/flat_camera_test.cpp
++//       -o build/tests/flat_camera_test
++#include <cmath>
++#include <cstdio>
++#include <numbers>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "input/flat_camera.h"
++
++using Input::FlatCamera;
++using Input::WorldPlacement;
++using Vec = Input::TrackVec;
++using Stick = FlatCamera::Stick;
++
++static int failures = 0;
++
++static void Check(bool ok, const std::string& what) {
++    std::printf("%s  %s\n", ok ? "ok  " : "FAIL", what.c_str());
++    failures += ok ? 0 : 1;
++}
++
++static bool Near(float a, float b, float tolerance = 1e-3f) {
++    return std::abs(a - b) < tolerance;
++}
++
++static constexpr double Rate = 250.0;
++static constexpr float Pi = std::numbers::pi_v<float>;
++
++/// A level: a floor, maybe a wall across the way behind the camera (a plane of constant z) and
++/// maybe walls either side (a corridor: planes of constant x, this far out).
++struct Level {
++    float floor = -1.0f;
++    std::optional<float> wall;
++    std::optional<float> sides;
++
++    /// How far along a cast the sphere first touches the level.
++    float Hit(const FlatCamera::Cast& c) const {
++        float first = 1.0f;
++        const auto plane = [&](float from, float to, float at) {
++            if (to == from) {
++                return;
++            }
++            const float t = (at - from) / (to - from);
++            if (t >= 0.0f && t < first) {
++                first = t;
++            }
++        };
++        plane(c.from.y, c.to.y, floor + c.radius);
++        if (wall) {
++            plane(c.from.z, c.to.z, *wall - c.radius);
++        }
++        if (sides) {
++            plane(c.from.x, c.to.x, *sides - c.radius);
++            plane(c.from.x, c.to.x, -*sides + c.radius);
++        }
++        return first;
++    }
++};
++
++struct Rig {
++    FlatCamera camera;
++    double now = 0.0;
++    Level level;
++
++    /// Runs the camera for `seconds` at the emulator's rate, answering its casts a frame late;
++    /// `hero(t)` says where the hero is.
++    template <typename Hero>
++    FlatCamera::Head Run(double seconds, Stick look, Stick move, Hero hero) {
++        FlatCamera::Head out = camera.Last();
++        for (double end = now + seconds; now < end;) {
++            now += 1.0 / Rate;
++            std::vector<float> hits;
++            for (const FlatCamera::Cast& c : camera.Casts()) {
++                hits.push_back(level.Hit(c));
++            }
++            out = camera.Update(now, look, move, hero(now), hits);
++        }
++        return out;
++    }
++};
++
++static std::optional<Vec> None(double) {
++    return std::nullopt;
++}
++
++static auto Standing(const Vec& at) {
++    return [at](double) { return std::optional<Vec>{at}; };
++}
++
++/// From the camera to the point it orbits.
++static float Out(const FlatCamera& camera) {
++    const Vec look = camera.LookPoint();
++    const Vec& at = camera.Last().position;
++    return std::hypot(at.x - look.x, at.y - look.y, at.z - look.z);
++}
++
++/// How far out the camera belongs at the pitch it looks down at.
++static float Belongs(const FlatCamera& camera) {
++    return camera.Frame(-camera.Last().pitch).radius;
++}
++
++static void AtTheSeat() {
++    Rig rig;
++    auto out = rig.Run(0.5, {1.0f, 0.0f}, {}, None);
++    Check(Near(out.yaw, -FlatCamera::SeatTurnSpeed * 0.5f, 0.02f), "at the seat the stick turns the view right");
++    const float turned = out.yaw;
++    out = rig.Run(1.0, {}, {}, None);
++    Check(Near(out.yaw, turned), "let go, the view stays turned");
++    out = rig.Run(2.0 * Pi / FlatCamera::SeatTurnSpeed, {1.0f, 0.0f}, {}, None);
++    Check(Near(Input::Wrap(out.yaw - turned), 0.0f, 0.05f), "it turns all the way round, without a limit");
++    out = rig.Run(5.0, {0.0f, 1.0f}, {}, None);
++    Check(Near(out.pitch, FlatCamera::MaxSeatPitch), "it looks up no further than straight up nearly");
++    Rig resting;
++    out = resting.Run(1.0, {0.1f, -0.1f}, {}, None);
++    Check(Near(out.yaw, 0.0f) && Near(out.pitch, 0.0f), "a stick at rest turns nothing");
++
++}
++
++static void Lean() {
++    // Held, a lean moves the head to that side of where it looks, at its speed; let go, back.
++    FlatCamera camera;
++    double now = 0.0;
++    FlatCamera::Head out = camera.Last();
++    for (; now < 1.0; now += 1.0 / Rate) {
++        out = camera.Update(now, {}, {}, std::nullopt, {}, {}, 1);
++    }
++    Check(Near(out.position.x, FlatCamera::LeanDistance), "a lean right moves the head right, as far as it goes");
++    for (; now < 2.0; now += 1.0 / Rate) {
++        out = camera.Update(now, {}, {}, std::nullopt, {}, {}, 0);
++    }
++    Check(Near(out.position.x, 0.0f), "let go, it comes back");
++}
++
++static void CatapultShot() {
++    // The hero waits in the controller to be shot at a target swinging across ahead: the view
++    // goes to the seat and faces the middle of the swing, whatever the stick; shot, the hero
++    // flies off and the view stays; once the hero rests where it came down, it is followed.
++    FlatCamera camera;
++    const Vec in_controller{0.0f, -0.4f, -0.3f};
++    static constexpr float SwingCycle = 7.0f;
++    double now = 0.0;
++    FlatCamera::Head out = camera.Last();
++    for (; now < 2.0; now += 1.0 / Rate) {
++        out = camera.Update(now, {}, {}, in_controller);
++    }
++    for (; now < 10.0; now += 1.0 / Rate) {
++        const float swing = std::sin(2.0f * Pi * static_cast<float>(now) / SwingCycle);
++        const Vec rings{swing, 1.0f, -5.0f};
++        out = camera.Update(now, {1.0f, 1.0f}, {}, in_controller, {}, {}, 0, rings);
++    }
++    const float up = std::atan2(1.0f, 5.0f);
++    FlatCamera still;
++    FlatCamera::Head kept = still.Last();
++    for (double t = 0.0; t < 6.0; t += 1.0 / Rate) {
++        kept = still.Update(t, {1.0f, 0.0f}, {}, in_controller, {}, {}, 0, Vec{0.0f, 1.0f, -5.0f});
++    }
++    Check(!Near(kept.yaw, 0.0f, 0.1f), "a target that does not swing is not one: the stick still turns the view");
++    Check(Near(out.position.x, 0.0f, 0.01f) && Near(out.position.y, 0.0f, 0.01f) && Near(out.position.z, 0.0f, 0.01f),
++          "waiting to be shot: at the seat");
++    Check(Near(out.yaw, 0.0f, 0.02f) && Near(out.pitch, up, 0.02f),
++          "facing the middle of the target's swing, the stick held over");
++    static constexpr float ShotSpeed = 20.0f;
++    const double shot = now;
++    for (; now < shot + 2.0; now += 1.0 / Rate) {
++        const Vec flying{0.0f, 0.5f, in_controller.z - ShotSpeed * static_cast<float>(now - shot)};
++        out = camera.Update(now, {}, {}, flying);
++    }
++    Check(Near(out.position.z, 0.0f, 0.01f) && Near(out.yaw, 0.0f, 0.02f) && Near(out.pitch, up, 0.02f),
++          "shot, the hero flies off and the view stays");
++    const Vec landed{0.0f, -1.0f, -3.0f};
++    for (; now < shot + 5.0; now += 1.0 / Rate) {
++        out = camera.Update(now, {}, {}, landed);
++    }
++    Check(out.position.z > landed.z && out.position.z < -1.0f, "come down and at rest, the hero is followed");
++}
++
++static void Arena() {
++    // In a room built round the seat the camera behind the hero turns to the way the seat faces
++    // and keeps it whatever the stick, and stands further out.
++    const Vec hero{2.0f, -1.0f, -3.0f};
++    // (Without the open's extra distance, the arena's own shows.)
++    FlatCamera::Settings no_open_extra;
++    no_open_extra.open_radius_extra = 0.0f;
++    Rig open, arena;
++    open.camera = arena.camera = FlatCamera{no_open_extra};
++    open.Run(4.0, {}, {}, Standing(hero));
++    FlatCamera::Head out{};
++    for (double now = 0.0; now < 4.0; now += 1.0 / Rate) {
++        std::vector<float> hits;
++        for (const FlatCamera::Cast& c : arena.camera.Casts()) {
++            hits.push_back(arena.level.Hit(c));
++        }
++        out = arena.camera.Update(now, {1.0f, 0.0f}, {}, hero, hits, {}, 0, std::nullopt, true);
++    }
++    Check(Near(out.yaw, 0.0f, 0.02f), "in an arena: facing the seat's way, the stick held over");
++    Check(Out(arena.camera) > Out(open.camera) + 0.9f, "in an arena: further out");
++}
++
++static void OpenSpace() {
++    // In the open the camera stands further out than its pitch alone calls for; in a corridor,
++    // about as far as that.
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    static constexpr float CorridorHalfWidth = 0.6f;
++    static constexpr float Settle = 8.0f;
++    Rig open;
++    open.Run(Settle, {}, {}, Standing(hero));
++    Rig corridor;
++    corridor.level.sides = CorridorHalfWidth;
++    corridor.Run(Settle, {}, {}, Standing(hero));
++    const float pitch_alone =
++        FlatCamera::Settings{}.radius_near +
++        (FlatCamera::Settings{}.radius_far - FlatCamera::Settings{}.radius_near) * open.camera.Frame(-open.camera.Last().pitch).share;
++    Check(Belongs(open.camera) > pitch_alone + 0.8f,
++          "in the open: further out (" + std::to_string(Belongs(open.camera) - pitch_alone) + " more)");
++    Check(Belongs(corridor.camera) < pitch_alone + 0.3f,
++          "in a corridor: about as far as its pitch calls for (" + std::to_string(Belongs(corridor.camera) - pitch_alone) +
++              " more)");
++}
++
++static void SideOn() {
++    // Running across in front of the seat (a side-on stretch): the view turns to the line from
++    // the seat to the hero, not after their running; round the seat, it goes round with them.
++    static constexpr float Ahead = 4.0f;
++    static constexpr float RunSpeed = 1.5f;
++    Rig across;
++    across.Run(2.0, {}, {}, Standing(Vec{-3.0f, -1.0f, -Ahead}));
++    const double start = across.now;
++    const auto running = [&](double t) {
++        return std::optional<Vec>{Vec{-3.0f + RunSpeed * static_cast<float>(t - start), -1.0f, -Ahead}};
++    };
++    auto out = across.Run(4.0, {}, {1.0f, 0.0f}, running);
++    const Vec end = *running(across.now);
++    const float seat_line = std::atan2(-end.x, -end.z);
++    Check(Near(out.yaw, seat_line, 0.25f), "running across before the seat: the view on the seat's line (" +
++                                               std::to_string(out.yaw) + " for " + std::to_string(seat_line) + ")");
++    // Turned by the player there, the view stays where it was turned (no spring back).
++    across.Run(0.4, {1.0f, 0.0f}, {1.0f, 0.0f}, running);
++    const float turned = across.camera.Last().yaw;
++    out = across.Run(3.0, {}, {1.0f, 0.0f}, running);
++    const float back_then = std::abs(Input::Wrap(turned - seat_line));
++    const float back_now = std::abs(Input::Wrap(out.yaw - std::atan2(-running(across.now)->x, -running(across.now)->z)));
++    Check(back_then > 0.3f && back_now >= back_then - 0.05f,
++          "turned by the player on the way, the view does not spring back to the seat's line (" +
++              std::to_string(back_now) + " off it, was " + std::to_string(back_then) + ")");
++    static constexpr float Round = 0.25f; // radians a second round the seat
++    Rig round;
++    round.Run(2.0, {}, {}, Standing(Vec{0.0f, -1.0f, -Ahead}));
++    const double off = round.now;
++    const auto circling = [&](double t) {
++        const float a = Round * static_cast<float>(t - off);
++        return std::optional<Vec>{Vec{-Ahead * std::sin(a), -1.0f, -Ahead * std::cos(a)}};
++    };
++    out = round.Run(8.0, {}, {}, circling);
++    const Vec at = *circling(round.now);
++    Check(Near(out.yaw, std::atan2(-at.x, -at.z), 0.3f), "going round the seat: the view goes round with the hero (" +
++                                                             std::to_string(out.yaw) + " for " +
++                                                             std::to_string(std::atan2(-at.x, -at.z)) + ")");
++}
++
++static void FallsToTheEnd() {
++    // A hero falling off with no floor under them is watched from where the camera was; back on
++    // a floor, they are followed again.
++    const Vec stand{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    rig.Run(3.0, {}, {}, Standing(stand));
++    const Vec before = rig.camera.Last().position;
++    static constexpr float FarBelow = 15.0f; // metres: something far down (a lower roof, a death plane)
++    rig.level.floor = stand.y - FarBelow;
++    static constexpr float Gravity = 9.8f;
++    const double off = rig.now;
++    const auto falling = [&](double t) {
++        const float down = Gravity / 2 * static_cast<float>((t - off) * (t - off));
++        return std::optional<Vec>{Vec{stand.x, stand.y - down, stand.z}};
++    };
++    auto out = rig.Run(1.5, {}, {}, falling);
++    const float moved = std::hypot(out.position.x - before.x, out.position.y - before.y, out.position.z - before.z);
++    // Metres down with the hero before it is seen falling (its speed tells a fall from sinking).
++    static constexpr float FollowsAtMost = 2.5f;
++    Check(moved < FollowsAtMost, "falling off: the camera stops where it was (" + std::to_string(moved) + " m, the hero " +
++                                     std::to_string(stand.y - falling(rig.now)->y) + " m down)");
++    Check(out.pitch < -Pi / 4, "and turns down after the hero (" + std::to_string(out.pitch) + ")");
++    const Vec at_the_end{stand.x, rig.level.floor, stand.z};
++    rig.Run(1.0, {}, {}, None);
++    out = rig.Run(0.5, {}, {}, Standing(at_the_end));
++    const float dipped = before.y - out.position.y;
++    Check(dipped < FollowsAtMost, "lost at the end below and seen there again: not followed down (" + std::to_string(dipped) + " m)");
++    // (Brought back into the controller, held up in the air: no floor under them.)
++    rig.level.floor = -1000.0f;
++    static constexpr float BroughtAside = 3.0f; // the respawn's place, off to the side
++    const Vec respawn{stand.x + BroughtAside, stand.y, stand.z};
++    out = rig.Run(0.25, {}, {}, Standing(respawn));
++    Check(Near(Out(rig.camera), Belongs(rig.camera), 0.1f) && out.position.y > stand.y,
++          "brought back where they fell from, the hero is taken up at once (" +
++              std::to_string(Out(rig.camera)) + " out of " + std::to_string(Belongs(rig.camera)) + ")");
++    Check(Near(out.yaw, 0.0f, 0.05f), "facing the way the seat does (" + std::to_string(out.yaw) + ")");
++    rig.level.floor = -1.0f;
++    out = rig.Run(3.0, {}, {}, Standing(stand));
++    const Vec lower{stand.x, stand.y - FarBelow, stand.z};
++    rig.level.floor = lower.y;
++    const double again = rig.now;
++    const auto down_there = [&](double t) {
++        const float down = std::min(Gravity / 2 * static_cast<float>((t - again) * (t - again)), FarBelow);
++        return std::optional<Vec>{Vec{stand.x, stand.y - down, stand.z}};
++    };
++    out = rig.Run(5.0, {}, {}, down_there);
++    Check(out.position.y > lower.y && out.position.y < stand.y, "come down far below and staying there: followed there");
++}
++
++static void FallsGoingOn() {
++    // Falling off while running on: the camera goes on across with the hero at the height it
++    // had, looking down at them.
++    const Vec stand{0.0f, -1.0f, -3.0f};
++    static constexpr float RunSpeed = 2.0f;
++    Rig rig;
++    rig.Run(3.0, {}, {}, Standing(stand));
++    const Vec before = rig.camera.Last().position;
++    rig.level.floor = -1000.0f;
++    static constexpr float Gravity = 9.8f;
++    const double off = rig.now;
++    const auto falling = [&](double t) {
++        const float s = static_cast<float>(t - off);
++        return std::optional<Vec>{Vec{stand.x, stand.y - Gravity / 2 * s * s, stand.z - RunSpeed * s}};
++    };
++    const auto out = rig.Run(1.5, {}, {}, falling);
++    const Vec hero = *falling(rig.now);
++    Check(std::abs(out.position.y - before.y) < 2.5f && out.position.z - hero.z < before.z - stand.z + 0.5f,
++          "falling while running on: the camera goes on across with the hero (" +
++              std::to_string(out.position.z - hero.z) + " m behind) and holds its height (" +
++              std::to_string(before.y - out.position.y) + " m down)");
++}
++
++static void FadesAtTheEnd() {
++    // Falling to the end: the picture fades to black; brought back, the camera is in its place
++    // before it fades back in. A short drop (water below) does not fade.
++    const Vec stand{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    rig.Run(3.0, {}, {}, Standing(stand));
++    rig.level.floor = -1000.0f;
++    static constexpr float Gravity = 9.8f;
++    const double off = rig.now;
++    const auto falling = [&](double t) {
++        const float s = static_cast<float>(t - off);
++        return std::optional<Vec>{Vec{stand.x, stand.y - Gravity / 2 * s * s, stand.z}};
++    };
++    auto out = rig.Run(2.0, {}, {}, falling);
++    Check(Near(out.dim, 1.0f), "fallen to the end: the picture black (" + std::to_string(out.dim) + ")");
++    out = rig.Run(0.5, {}, {}, None);
++    Check(Near(out.dim, 1.0f), "the hero lost there: still black");
++    out = rig.Run(0.3, {}, {}, Standing(stand));
++    Check(out.dim > 0.5f && Near(Out(rig.camera), Belongs(rig.camera), 0.1f),
++          "brought back: the camera in its place while the picture is still dark");
++    out = rig.Run(1.5, {}, {}, Standing(stand));
++    Check(Near(out.dim, 0.0f), "then the picture fades back in");
++}
++
++static void SinksInWater() {
++    // Sinking in water (slower than a fall) far below where the hero stood: still followed.
++    const Vec stand{0.0f, -1.0f, -3.0f};
++    static constexpr float Depth = 7.0f;
++    static constexpr float SinkSpeed = 3.0f;
++    Rig rig;
++    rig.Run(3.0, {}, {}, Standing(stand));
++    rig.level.floor = -1000.0f;
++    const double off = rig.now;
++    const auto sinking = [&](double t) {
++        const float down = std::min(SinkSpeed * static_cast<float>(t - off), Depth);
++        return std::optional<Vec>{Vec{stand.x, stand.y - down, stand.z}};
++    };
++    const auto out = rig.Run(4.0, {}, {}, sinking);
++    const float gap = std::hypot(out.position.x - stand.x, out.position.y - (stand.y - Depth), out.position.z - stand.z);
++    Check(gap < 3.0f, "sinking in water: followed down (" + std::to_string(gap) + " m off)");
++}
++
++static void FallsIntoWater() {
++    // Falling into water far below (found by no cast) and bobbing there: once the hero stays
++    // about one place a while, they are followed there.
++    const Vec stand{0.0f, -1.0f, -3.0f};
++    static constexpr float Drop = 7.0f;
++    static constexpr float Bob = 0.05f;    // metres up and down
++    static constexpr float BobRate = 3.0f; // a second
++    Rig rig;
++    rig.Run(3.0, {}, {}, Standing(stand));
++    rig.level.floor = -1000.0f;
++    const double off = rig.now;
++    static constexpr float Gravity = 9.8f;
++    const auto into_water = [&](double t) {
++        const float fall = Gravity / 2 * static_cast<float>((t - off) * (t - off));
++        const float bob = fall < Drop ? 0.0f : Bob * std::sin(2.0f * Pi * BobRate * static_cast<float>(t));
++        return std::optional<Vec>{Vec{stand.x, stand.y - std::min(fall, Drop) + bob, stand.z}};
++    };
++    const auto mid = rig.Run(1.0, {}, {}, into_water);
++    Check(Near(mid.dim, 0.0f), "a drop into water is not the end: no fade");
++    const auto out = rig.Run(5.0, {}, {}, into_water);
++    const float gap = std::hypot(out.position.x - stand.x, out.position.y - (stand.y - Drop), out.position.z - stand.z);
++    Check(gap < 3.0f, "fallen into water and bobbing there: followed there (" + std::to_string(gap) + " m off)");
++}
++
++static void BehindTheHero() {
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    auto out = rig.Run(2.0, {}, {}, Standing(hero));
++    Check(Near(Out(rig.camera), Belongs(rig.camera), 0.02f), "mounted at the distance its pitch calls for");
++    Check(out.position.z > hero.z && out.position.y > hero.y, "mounted behind the hero and above them");
++    Check(Near(out.yaw, 0.0f, 0.02f) && out.pitch < 0.0f, "looking at the hero, down");
++
++    rig.Run(0.5, {1.0f, 0.0f}, {}, Standing(hero));
++    out = rig.Run(0.5, {}, {}, Standing(hero));
++    const float swung = out.yaw;
++    Check(swung < -0.5f, "the camera stick swings it round the hero");
++    out = rig.Run(3.0, {}, {}, Standing(hero));
++    Check(Near(out.yaw, swung, 0.02f), "let go, it stays where it was swung (no spring back)");
++
++    // Gone (a menu): back to the seat, looking the way it did when it let go.
++    rig.Run(FlatCamera::LeaveAfter + 0.05, {}, {}, None);
++    const float last_yaw = rig.camera.Last().yaw;
++    out = rig.Run(4.0, {}, {}, None);
++    Check(Near(out.position.x, 0.0f, 0.01f) && Near(out.position.z, 0.0f, 0.01f) && Near(out.yaw, last_yaw, 0.01f),
++          "with no hero it goes back to the seat, still looking the same way");
++}
++
++static void TurnsAfterTheHero() {
++    // Running sideways (move stick right, the hero going right across the view): it turns after
++    // them. Running at the camera, or sideways without moving: it does not.
++    const Vec start{0.0f, -1.0f, -3.0f};
++    const auto running = [&](Rig& rig, Vec way) {
++        const double from = rig.now;
++        return [=](double t) {
++            const float d = static_cast<float>(t - from);
++            return std::optional<Vec>{Vec{start.x + way.x * d, start.y, start.z + way.z * d}};
++        };
++    };
++    Rig sideways;
++    sideways.Run(2.0, {}, {}, Standing(start));
++    auto out = sideways.Run(2.0, {}, {1.0f, 0.0f}, running(sideways, {1.0f, 0.0f, 0.0f}));
++    Check(out.yaw < -0.3f, "running sideways turns the camera after the hero");
++
++    Rig at;
++    at.Run(2.0, {}, {}, Standing(start));
++    out = at.Run(1.0, {}, {0.0f, -1.0f}, running(at, {0.0f, 0.0f, 1.0f}));
++    Check(Near(out.yaw, 0.0f, 0.02f), "running at the camera does not swing it round");
++
++    Rig blocked;
++    blocked.Run(2.0, {}, {}, Standing(start));
++    out = blocked.Run(1.0, {}, {1.0f, 0.0f}, Standing(start));
++    Check(Near(out.yaw, 0.0f, 0.02f), "pushing sideways without moving turns nothing");
++}
++
++static void Pitch() {
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    rig.Run(2.0, {}, {}, Standing(hero));
++    const float resting = Out(rig.camera);
++    rig.Run(0.4, {0.0f, -1.0f}, {}, Standing(hero)); // stick down: from higher up
++    rig.Run(0.3, {}, {}, Standing(hero));             // the stick's own smoothing settles
++    const float high = Out(rig.camera);
++    Check(high > resting + 0.1f, "looking down from higher up, it sits further out");
++    Check(Near(high, Belongs(rig.camera), 0.05f), "at the distance that pitch calls for");
++    const float raised = rig.camera.Last().pitch;
++    rig.Run(3.0, {}, {}, Standing(hero));
++    Check(Near(rig.camera.Last().pitch, raised, 0.02f), "left alone with the hero standing, it keeps its pitch");
++    const double from = rig.now;
++    rig.Run(4.0, {}, {0.0f, 1.0f}, [&](double t) {
++        return std::optional<Vec>{Vec{hero.x, hero.y, hero.z - static_cast<float>(t - from)}};
++    });
++    const FlatCamera::Settings settings;
++    Check(Near(-rig.camera.Last().pitch, settings.rest_pitch, 0.08f), "as the hero moves on, it rests back");
++}
++
++static void Walls() {
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    // (Without the open's extra distance: taking the wall away would open the space too.)
++    FlatCamera::Settings no_open_extra;
++    no_open_extra.open_radius_extra = 0.0f;
++    rig.camera = FlatCamera{no_open_extra};
++    rig.Run(2.0, {}, {}, Standing(hero));
++    const float open = rig.camera.Last().position.z;
++    rig.level.wall = hero.z + 0.3f;
++    rig.Run(0.05, {}, {}, Standing(hero));
++    Check(rig.camera.Last().position.z < *rig.level.wall, "a wall behind it pulls it in at once");
++    rig.level.wall = hero.z + 0.01f;
++    rig.Run(0.05, {}, {}, Standing(hero));
++    Check(Out(rig.camera) >= FlatCamera::NearestOut - 1e-3f, "a wall right behind the hero pulls it no closer than its nearest");
++    rig.level.wall.reset();
++    rig.Run(2.0, {}, {}, Standing(hero));
++    Check(rig.camera.Last().position.z < hero.z + 0.35f, "the wall gone, it does not move out by itself");
++    rig.Run(3.0, {}, {0.0f, 1.0f}, Standing(hero));
++    Check(Near(rig.camera.Last().position.z, open, 0.05f), "played on, it lets out to its distance");
++}
++
++static void Ground() {
++    // A jump does not move the camera's height much; standing higher up does.
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    rig.Run(2.0, {}, {}, Standing(hero));
++    const float level = rig.camera.Last().position.y;
++    const double from = rig.now;
++    float highest = level;
++    for (int i = 0; i < 50; ++i) {
++        const auto out = rig.Run(0.01, {}, {}, [&](double t) {
++            const float u = static_cast<float>(t - from) / 0.5f;
++            return std::optional<Vec>{Vec{hero.x, hero.y + 0.3f * std::sin(Pi * std::min(u, 1.0f)), hero.z}};
++        });
++        highest = std::max(highest, out.position.y);
++    }
++    Check(highest - level < 0.1f, "a jump barely lifts the camera (" + std::to_string(highest - level) + " m)");
++    rig.level.floor = 0.0f; // stepped up, playing on
++    rig.Run(3.0, {}, {0.0f, 1.0f}, Standing({hero.x, 0.0f, hero.z}));
++    Check(rig.camera.Last().position.y > level + 0.8f, "on higher ground, it rises with the hero");
++}
++
++static void NoFloorFound() {
++    // With no floor in reach, a hero standing (stirring by a hair) after a drop does not jump the
++    // camera's height: it eases from where it is, not from a height left over from before.
++    Rig rig;
++    rig.level.floor = -1000.0f;
++    rig.Run(2.0, {}, {}, Standing({0.0f, 0.0f, -3.0f}));
++    rig.Run(2.0, {}, {}, Standing({0.0f, -1.0f, -3.0f}));
++    float previous = rig.camera.Last().position.y;
++    float largest = 0.0f;
++    for (int i = 0; i < 500; ++i) {
++        const float stir = (i / 3) % 2 == 0 ? 0.002f : -0.002f;
++        const float y = rig.Run(1.0 / Rate, {}, {}, Standing({0.0f, -1.0f + stir, -3.0f})).position.y;
++        largest = std::max(largest, std::abs(y - previous));
++        previous = y;
++    }
++    Check(largest < 0.005f, "no floor found, a hero standing still does not jump the camera (" +
++                                std::to_string(largest) + " m an update)");
++}
++
++static void MenuOverHero() {
++    // A menu room keeps its fixed view even while a hero seems to be there (a stale one).
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    FlatCamera camera;
++    FlatCamera::Head out;
++    for (double now = 0.0; now < 3.0; now += 1.0 / Rate) {
++        out = camera.Update(now, {1.0f, 0.0f}, {}, hero, {}, {.fixed = true});
++    }
++    Check(Near(out.yaw, 0.0f, 0.01f) && Near(out.position.z, 0.0f, 0.01f), "a menu stays fixed even with a hero seen");
++}
++
++static void Menus() {
++    // A menu not to be turned: it faces ahead whatever the stick; with headings, a press right
++    // or left steps to the next one, holding it steps no further, and home turns back ahead.
++    FlatCamera camera;
++    double now = 0.0;
++    const auto run = [&](double seconds, Stick look, FlatCamera::Menu menu) {
++        FlatCamera::Head out = camera.Last();
++        for (double end = now + seconds; now < end;) {
++            now += 1.0 / Rate;
++            out = camera.Update(now, look, {}, std::nullopt, {}, menu);
++        }
++        return out;
++    };
++    auto out = run(2.0, {1.0f, 0.5f}, {.fixed = true});
++    Check(Near(out.yaw, 0.0f, 0.01f) && Near(out.pitch, 0.0f, 0.01f), "a fixed menu faces ahead whatever the stick");
++    const std::vector<Input::MenuStep> steps{{-1.2f, 0.0f}, {0.0f, 0.0f}, {1.2f, 0.3f}};
++    out = run(2.0, {1.0f, 0.0f}, {.fixed = true, .steps = steps});
++    Check(Near(out.yaw, 0.0f, 0.01f), "with headings it starts at the nearest; the stick steps nothing");
++    out = run(4.0, {}, {.fixed = true, .steps = steps, .step = 1});
++    Check(Near(out.yaw, -1.2f, 0.01f), "a press right steps one heading right, held it steps no further");
++    run(0.2, {}, {.fixed = true, .steps = steps});
++    run(0.2, {}, {.fixed = true, .steps = steps, .step = -1});
++    run(0.2, {}, {.fixed = true, .steps = steps});
++    out = run(4.0, {}, {.fixed = true, .steps = steps, .step = -1});
++    Check(Near(out.yaw, 1.2f, 0.01f) && Near(out.pitch, 0.3f, 0.01f), "two presses left: the step that looks up");
++    out = run(4.0, {}, {.fixed = true, .steps = steps, .home = true});
++    Check(Near(out.yaw, 0.0f, 0.01f), "home turns it back ahead");
++}
++
++static void SceneChanges() {
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig rig;
++    // Something that looks like a hero for a moment while a scene changes over.
++    auto out = rig.Run(FlatCamera::FollowAfter * 0.5, {}, {}, Standing(hero));
++    out = rig.Run(1.0, {}, {}, None);
++    Check(Near(out.position.x, 0.0f) && Near(out.position.y, 0.0f) && Near(out.position.z, 0.0f) &&
++              Near(out.yaw, 0.0f) && Near(out.pitch, 0.0f),
++          "a hero seen only for a moment is not followed: the camera stays at the seat");
++    rig.Run(2.0, {}, {}, Standing(hero));
++    const auto before = rig.camera.Last();
++    out = rig.Run(FlatCamera::LeaveAfter * 0.5, {}, {}, None);
++    Check(std::hypot(out.position.x - before.position.x, out.position.z - before.position.z) < 0.05f,
++          "a hero lost for a moment is still followed");
++}
++
++static void Configured() {
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    Rig small;
++    small.level.floor = -10.0f;
++    small.Run(2.0, {}, {}, Standing(hero));
++    FlatCamera::Settings settings;
++    settings.scale = 2.0f;
++    Rig big{FlatCamera{settings}, 0.0, {}};
++    big.level.floor = -10.0f;
++    big.Run(2.0, {}, {}, Standing(hero));
++    Check(Near(Out(big.camera), Out(small.camera) * 2.0f, 0.03f),
++          "a title's hero twice the size: the camera twice as far out");
++}
++
++static void Zoom() {
++    FlatCamera::Settings settings;
++    settings.zoom = 1.6f;
++    Rig rig{FlatCamera{settings}, 0.0, {}};
++    const Vec hero{0.0f, -1.0f, -3.0f};
++    auto out = rig.Run(3.0, {}, {}, Standing(hero));
++    Check(out.zoom > 1.6f, "behind the hero the picture is enlarged, more the narrower the view");
++    out = rig.Run(3.0, {}, {}, None);
++    Check(Near(out.zoom, 1.0f, 0.01f), "with no hero (menus) it is shown as drawn");
++}
++
++static void BackToTheWorld() {
++    WorldPlacement placement;
++    placement.NotePose(0.0, {0.3f, 0.1f, -0.5f}, 0.4f);
++    placement.Update(1.0, {12.0f, 2.0f, -21.0f}, {-std::sin(1.0f), 0.0f, -std::cos(1.0f)}, 3.0f);
++    const Vec p{-1.0f, 0.5f, -2.0f};
++    const Vec back = placement.ToTrack(placement.ToWorld(p));
++    Check(Near(back.x, p.x) && Near(back.y, p.y) && Near(back.z, p.z), "tracking space to the world and back");
++}
++
++static void Placement() {
++    // A world 3 units to the metre, its origin at (10, 1, -20), turned 90 degrees left.
++    const float scale = 3.0f;
++    const Vec origin{10.0f, 1.0f, -20.0f};
++    const float turn = Pi / 2;
++    const auto to_world = [&](const Vec& track) {
++        const Vec t = WorldPlacement::Turn(track, turn);
++        return Vec{origin.x + t.x * scale, origin.y + t.y * scale, origin.z + t.z * scale};
++    };
++    const Vec pose{0.5f, 0.2f, -1.0f};
++    const float pose_yaw = 0.3f;
++    const Vec forward = WorldPlacement::Turn(Vec{-std::sin(pose_yaw), 0.0f, -std::cos(pose_yaw)}, turn);
++    WorldPlacement placement;
++    placement.NotePose(0.0, pose, pose_yaw);
++    placement.Update(1.0, to_world(pose), forward, scale);
++    const Vec hero{-2.0f, -1.0f, -4.0f};
++    const Vec back = placement.ToTrack(to_world(hero));
++    Check(Near(back.x, hero.x) && Near(back.y, hero.y) && Near(back.z, hero.z),
++          "a turned, moved, scaled world is placed back where it is");
++}
++
++static void LateTitle() {
++    // The title answers two of its frames late while the camera swings round fast and the title
++    // carries the seat along at a metre a second: what is followed must not seem to jump.
++    const float scale = 3.0f;
++    const double lag = WorldPlacement::TitleLag;
++    const auto origin_at = [&](double t) { return Vec{0.0f, 0.0f, static_cast<float>(-3.0 * t)}; };
++    const auto pose_at = [](double t) {
++        return Vec{static_cast<float>(1.5 * std::sin(2.0 * t)), 1.0f, static_cast<float>(1.5 * std::cos(2.0 * t))};
++    };
++    const auto yaw_at = [](double t) { return static_cast<float>(2.0 * t); };
++    const Vec hero_world{2.0f, 0.0f, -8.0f};
++    WorldPlacement placement;
++    float worst = 0.0f;
++    for (int i = 0; i < 1000; ++i) {
++        const double t = i / Rate;
++        placement.NotePose(t, pose_at(t), yaw_at(t));
++        if (t < lag) {
++            continue;
++        }
++        const double then = t - lag;
++        const Vec o = origin_at(then);
++        const Vec p = pose_at(then);
++        const Vec head{o.x + p.x * scale, o.y + p.y * scale, o.z + p.z * scale};
++        const float y = yaw_at(then);
++        placement.Update(t, head, Vec{-std::sin(y), 0.0f, -std::cos(y)}, scale);
++        if (t > 0.5) {
++            const Vec seen = placement.ToTrack(hero_world);
++            const Vec truth{(hero_world.x - o.x) / scale, (hero_world.y - o.y) / scale, (hero_world.z - o.z) / scale};
++            worst = std::max(worst, std::hypot(seen.x - truth.x, seen.y - truth.y, seen.z - truth.z));
++        }
++    }
++    Check(worst < 0.05f, "a title answering late, a camera swinging and a seat moving: the hero holds still (" +
++                             std::to_string(worst) + " m)");
++}
++
++int main() {
++    AtTheSeat();
++    Lean();
++    CatapultShot();
++    Arena();
++    OpenSpace();
++    SideOn();
++    FallsToTheEnd();
++    FallsGoingOn();
++    FadesAtTheEnd();
++    SinksInWater();
++    FallsIntoWater();
++    BehindTheHero();
++    TurnsAfterTheHero();
++    Pitch();
++    Walls();
++    Ground();
++    NoFloorFound();
++    Menus();
++    MenuOverHero();
++    SceneChanges();
++    Configured();
++    Zoom();
++    Placement();
++    LateTitle();
++    BackToTheWorld();
++    std::printf("%s\n", failures == 0 ? "all passed" : "FAILED");
++    return failures == 0 ? 0 : 1;
++}
